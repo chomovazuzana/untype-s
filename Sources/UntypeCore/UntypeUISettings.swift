@@ -1357,11 +1357,28 @@ public struct MeetingPreferences: Codable, Equatable, Sendable {
     public var silenceMinutes: Int
     /// Folder of the meeting folders (nil: `~/Documents/untype Meetings`).
     public var folder: String?
+    /// The `nbg-m365` CLI that reads the Outlook calendar (nil: the calendar
+    /// is not used — no meeting names from the calendar, no reminders).
+    public var calendarCLI: String?
 
-    public init(language: String = MeetingTranscriptLanguage.english.rawValue, silenceMinutes: Int = Self.defaultSilenceMinutes, folder: String? = nil) {
+    public init(
+        language: String = MeetingTranscriptLanguage.english.rawValue,
+        silenceMinutes: Int = Self.defaultSilenceMinutes,
+        folder: String? = nil,
+        calendarCLI: String? = nil
+    ) {
         self.language = language
         self.silenceMinutes = silenceMinutes
         self.folder = folder
+        self.calendarCLI = calendarCLI
+    }
+
+    /// The calendar CLI when the calendar is on.
+    public var calendarCLIURL: URL? {
+        guard let calendarCLI, !calendarCLI.isEmpty else {
+            return nil
+        }
+        return URL(fileURLWithPath: (calendarCLI as NSString).expandingTildeInPath)
     }
 
     public var transcriptLanguage: MeetingTranscriptLanguage {

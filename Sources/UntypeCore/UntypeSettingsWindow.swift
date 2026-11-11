@@ -334,10 +334,22 @@ struct UntypeSettingsView: View {
                     }
                 }
             }
+            Toggle("Use my Outlook calendar", isOn: Binding(
+                get: { model.settings.meeting.calendarCLIURL != nil },
+                set: { model.setCalendarEnabled($0) }
+            ))
+            if !model.calendarStatus.isEmpty {
+                LabeledContent("Calendar") {
+                    Text(model.calendarStatus)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .truncationMode(.tail)
+                }
+            }
         } header: {
             Text("Meeting recording")
         } footer: {
-            caption("Hover the overlay and click ⏺ to record both sides of a call (your microphone and the call's sound). Each meeting gets a folder with transcript.txt, transcript.original.txt (as spoken) and transcript.jsonl. Needs Screen & System Audio Recording permission; headphones avoid the call being heard twice.")
+            caption("Hover the overlay and click ⏺ to record both sides of a call (your microphone and the call's sound). Each meeting gets a folder with transcript.txt, transcript.original.txt (as spoken) and transcript.jsonl. Needs Screen & System Audio Recording permission; headphones avoid the call being heard twice. With the Outlook calendar on (read through the nbg-m365 CLI), the overlay says when a Teams meeting you accepted starts, with a Record button, and a recording made during a meeting is named after it, its required participants listed at the top of the transcript.")
         }
 
         Section("Current session") {

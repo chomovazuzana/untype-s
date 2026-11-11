@@ -77,6 +77,7 @@ private final class UntypeAppDelegate: NSObject, NSApplicationDelegate, NSWindow
         self.hotkeyMonitor = hotkeyMonitor
         model.configureHotkeyServices()
         overlay.applyAlwaysVisible()
+        model.startCalendarWatch()
 
         let content = UntypeRootView(model: model)
         let initialCompact = model.settings.compactWindow
@@ -366,6 +367,22 @@ final class UntypeUIModel: ObservableObject {
     let meetingNamer = MeetingNamer()
     private var namingFolder: URL?
     private var namingLLM: LLMConfig?
+
+    /// Today's Outlook meetings (Settings → Meeting recording → "Use my
+    /// Outlook calendar"), refreshed every few minutes.
+    private(set) var calendarMeetings: [CalendarMeeting] = []
+    /// What the calendar is doing, for Settings ("6 meetings today", an error).
+    @Published private(set) var calendarStatus = ""
+    private var calendarMe: String?
+    private var calendarTimer: Timer?
+    private var calendarRefreshedAt: Date?
+    private var calendarRefreshing = false
+    private var reminderQueue = MeetingReminderQueue()
+    /// The calendar meeting the current recording was started for (from
+    /// the reminder's Record), and when the recording started.
+    private var recordingCalendarMeeting: CalendarMeeting?
+    private var recordingStartedAt: Date?
+    private static let calendarRefreshInterval: TimeInterval = 2 * 60
 
     /// Microphone samples of the current push-to-talk turn, for the overlay trace.
     var microphoneWaveform: UntypeWaveformBuffer? {
@@ -1891,6 +1908,14 @@ final class UntypeUIModel: ObservableObject {
             return
         }
         meetingBusy = true
+        recordingStartedAt = Date()
+        if let me = calendarMe, let meeting = recordingCalendarMeeting
+            ?? MeetingCalendar.meeting(forRecordingFrom: Date(), to: Date(), in: calendarMeetings, me: me) {
+            reminderQueue.handle(meeting)
+        }
+        if overlay?.reminderMeetingID != nil {
+            overlay?.hideNow()
+        }
         // The red trace shows at once; the audio fills it as soon as the
         // capture runs.
         overlay?.setMeeting(start: Date())
@@ -2016,6 +2041,8 @@ final class UntypeUIModel: ObservableObject {
     }
 
     private func meetingStartFailed(_ error: Error) {
+        recordingCalendarMeeting = nil
+        recordingStartedAt = nil
         let message = error.localizedDescription
         appendEvent("diagnostic.warning: [untype] meeting recording could not start: \(message)")
         if case MeetingError.screenRecordingPermission = error {
@@ -2039,11 +2066,233 @@ final class UntypeUIModel: ObservableObject {
         case .failure:
             headline = "Stopped by an error"
         }
+        let calendarMeeting = recordingCalendarMeeting
+        let startedAt = recordingStartedAt
+        recordingCalendarMeeting = nil
+        recordingStartedAt = nil
         guard let folder, FileManager.default.fileExists(atPath: MeetingNaming.mainTranscript(in: folder).path) else {
             overlay?.showNotice(headline)
             return
         }
-        showSavedNotice(folder, headline: headline)
+        guard settings.meeting.calendarCLIURL != nil, let startedAt,
+              !folder.lastPathComponent.contains(MeetingNaming.separator) else {
+            showSavedNotice(folder, headline: headline)
+            return
+        }
+        overlay?.showNotice("Naming it from your calendar…", seconds: 30)
+        Task { [weak self] in
+            await self?.nameFromCalendar(folder, startedAt: startedAt, endedAt: Date(), chosen: calendarMeeting, headline: headline)
+        }
+    }
+
+    /// A recording made during a meeting of the calendar takes that
+    /// meeting's name (the model refines the subject and the required
+    /// participants) and starts with a header saying what it was. The user
+    /// can still rename it from the saved card.
+    private func nameFromCalendar(_ folder: URL, startedAt: Date, endedAt: Date, chosen: CalendarMeeting?, headline: String) async {
+        if chosen == nil {
+            await refreshCalendar()
+        }
+        guard let me = calendarMe,
+              let meeting = chosen ?? MeetingCalendar.meeting(forRecordingFrom: startedAt, to: endedAt, in: calendarMeetings, me: me) else {
+            showSavedNotice(folder, headline: headline)
+            return
+        }
+        let title = await calendarTitle(meeting, me: me)
+        do {
+            let header = MeetingCalendar.transcriptHeader(meeting, me: me)
+            for name in ["transcript.txt", "transcript.original.txt"] {
+                let file = folder.appendingPathComponent(name)
+                if let text = try? String(contentsOf: file, encoding: .utf8) {
+                    try (header + text).write(to: file, atomically: true, encoding: .utf8)
+                }
+            }
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            encoder.dateEncodingStrategy = .iso8601
+            try encoder.encode(meeting).write(to: folder.appendingPathComponent("meeting.json"))
+            let renamed = try MeetingNaming.rename(folder: folder, title: title)
+            lastMeetingFolder = renamed
+            appendEvent("diagnostic.info: [untype] meeting named from the calendar: \(renamed.lastPathComponent)")
+            showSavedNotice(renamed, headline: headline)
+        } catch {
+            appendEvent("diagnostic.warning: [untype] meeting could not be named from the calendar: \(error.localizedDescription)")
+            showSavedNotice(folder, headline: headline)
+        }
+    }
+
+    private func calendarTitle(_ meeting: CalendarMeeting, me: String) async -> String {
+        let plain = MeetingCalendar.plainTitle(meeting, me: me)
+        guard let llm = try? meetingOptions().llm,
+              let model = try? LLMRefinerFactory.makeTranslator(config: llm, systemPrompt: MeetingCalendar.titlePrompt) else {
+            return plain
+        }
+        defer { model.dispose() }
+        guard let answer = try? await model.refine(MeetingCalendar.titleRequest(meeting, me: me)) else {
+            appendEvent("diagnostic.warning: [untype] the calendar title model did not answer; using the calendar subject")
+            return plain
+        }
+        let title = MeetingNaming.sanitize(answer.split(separator: "\n").first.map(String.init) ?? answer)
+        return title.isEmpty ? plain : title
+    }
+
+    // MARK: Outlook calendar (reminders and names)
+
+    /// Starts (or stops, when the calendar is off) reading the calendar and
+    /// checking for meetings that start.
+    func startCalendarWatch() {
+        calendarTimer?.invalidate()
+        calendarTimer = nil
+        calendarMeetings = []
+        calendarMe = nil
+        calendarRefreshedAt = nil
+        guard settings.meeting.calendarCLIURL != nil else {
+            calendarStatus = ""
+            if overlay?.reminderMeetingID != nil {
+                overlay?.hideNow()
+            }
+            return
+        }
+        calendarStatus = "Reading the calendar…"
+        let timer = Timer(timeInterval: 15, repeats: true) { _ in
+            dispatchToUI { [weak self] in
+                self?.calendarTick()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        calendarTimer = timer
+        calendarTick()
+    }
+
+    private func calendarTick() {
+        let now = Date()
+        let stale = calendarRefreshedAt.map {
+            now.timeIntervalSince($0) >= Self.calendarRefreshInterval || !Calendar.current.isDate($0, inSameDayAs: now)
+        } ?? true
+        if stale, !calendarRefreshing {
+            Task { [weak self] in
+                await self?.refreshCalendar()
+                self?.checkReminder()
+            }
+        }
+        checkReminder()
+    }
+
+    func refreshCalendar() async {
+        guard let url = settings.meeting.calendarCLIURL, !calendarRefreshing else {
+            return
+        }
+        calendarRefreshing = true
+        defer {
+            calendarRefreshing = false
+            calendarRefreshedAt = Date()
+        }
+        let cli = OutlookCalendarCLI(executable: url)
+        do {
+            if calendarMe == nil {
+                calendarMe = try await cli.signedInAddress()
+            }
+            let meetings = try await cli.meetings(on: Date())
+            guard settings.meeting.calendarCLIURL == url else {
+                return
+            }
+            calendarMeetings = meetings
+            calendarStatus = calendarSummary(meetings)
+        } catch {
+            let message = error.localizedDescription
+            if calendarStatus != message {
+                appendEvent("diagnostic.warning: [untype] calendar: \(message)")
+            }
+            calendarStatus = message
+        }
+    }
+
+    private func calendarSummary(_ meetings: [CalendarMeeting]) -> String {
+        guard let me = calendarMe else {
+            return ""
+        }
+        let attended = meetings.filter { MeetingCalendar.isAttended($0, me: me) }
+        let format = DateFormatter()
+        format.dateFormat = "HH:mm"
+        let next = attended.filter { $0.end > Date() }.min { $0.start < $1.start }
+        let count = attended.count == 1 ? "1 meeting today" : "\(attended.count) meetings today"
+        guard let next else {
+            return count
+        }
+        return "\(count) · next: \(MeetingCalendar.cleanSubject(next.subject)) at \(format.string(from: next.start))"
+    }
+
+    /// Shows the "starting now" card when a meeting starts (waiting while
+    /// a dictation or another card is on screen), and takes it away when
+    /// it is no longer due.
+    private func checkReminder() {
+        guard let overlay, let me = calendarMe else {
+            return
+        }
+        let due = reminderQueue.current(
+            now: Date(),
+            meetings: calendarMeetings,
+            me: me,
+            recording: meetingRecorder.isRecording || meetingBusy
+        )
+        if let due {
+            let caption = MeetingCalendar.reminderCaption(due, now: Date())
+            if overlay.reminderMeetingID == due.id {
+                overlay.updateReminderCaption(caption)
+            } else if overlay.overlayPhase == "idle", !hotkeyPressed {
+                overlay.showReminder(
+                    id: due.id,
+                    caption: caption,
+                    title: MeetingCalendar.cleanSubject(due.subject),
+                    detail: MeetingCalendar.reminderDetail(due, me: me)
+                )
+                appendEvent("diagnostic.info: [untype] meeting reminder: \(due.subject)")
+            }
+        } else if overlay.reminderMeetingID != nil {
+            overlay.hideNow()
+        }
+    }
+
+    /// Record on the reminder: the recording is that meeting.
+    func recordRemindedMeeting() {
+        guard let id = overlay?.reminderMeetingID, let meeting = calendarMeetings.first(where: { $0.id == id }) else {
+            overlay?.hideNow()
+            return
+        }
+        reminderQueue.handle(meeting)
+        appendEvent("diagnostic.info: [untype] meeting reminder: Record (\(meeting.subject))")
+        overlay?.hideNow()
+        guard !meetingRecorder.isRecording, !meetingBusy else {
+            return
+        }
+        recordingCalendarMeeting = meeting
+        toggleMeetingRecording()
+    }
+
+    func dismissReminder() {
+        if let id = overlay?.reminderMeetingID, let meeting = calendarMeetings.first(where: { $0.id == id }) {
+            reminderQueue.handle(meeting)
+            appendEvent("diagnostic.info: [untype] meeting reminder: dismissed (\(meeting.subject))")
+        }
+        overlay?.hideNow()
+    }
+
+    /// Settings → Meeting recording → "Use my Outlook calendar". Turning it
+    /// on finds the `nbg-m365` CLI of the Claude Code plugin.
+    func setCalendarEnabled(_ enabled: Bool) {
+        var meeting = settings.meeting
+        if enabled {
+            guard let cli = OutlookCalendarCLI.discover() else {
+                calendarStatus = "The nbg-m365 CLI was not found: install the nbg-m365 Claude Code plugin and sign in."
+                appendEvent("diagnostic.warning: [untype] calendar: \(calendarStatus)")
+                return
+            }
+            meeting.calendarCLI = cli.path
+        } else {
+            meeting.calendarCLI = nil
+        }
+        setMeetingPreferences(meeting)
+        startCalendarWatch()
     }
 
     fileprivate func appendEvent(_ line: String) {
@@ -3221,6 +3470,11 @@ private final class UntypeOverlayController: ObservableObject {
     @Published fileprivate private(set) var noticeRenameLabel = "Name"
     /// The words heard so far while naming a meeting.
     @Published fileprivate private(set) var namingHeard = ""
+    /// The calendar meeting the "starting now" card is about (nil: no card).
+    @Published private(set) var reminderMeetingID: String?
+    @Published fileprivate private(set) var reminderCaption = "Starting now"
+    @Published fileprivate private(set) var reminderTitle = ""
+    @Published fileprivate private(set) var reminderDetail = ""
     /// Listening has ended; the name is being made from the words.
     @Published fileprivate private(set) var namingWorking = false
     /// Cancel was chosen; the listening is being closed.
@@ -3255,6 +3509,8 @@ private final class UntypeOverlayController: ObservableObject {
     fileprivate static let renameKey = "rename"
     fileprivate static let namingDoneKey = "naming.done"
     fileprivate static let namingCancelKey = "naming.cancel"
+    fileprivate static let reminderRecordKey = "reminder.record"
+    fileprivate static let reminderDismissKey = "reminder.dismiss"
     fileprivate static let translationKeyPrefix = "translate:"
 
     init(model: UntypeUIModel) {
@@ -3293,6 +3549,7 @@ private final class UntypeOverlayController: ObservableObject {
         noticeAction = nil
         noticeRenameAction = nil
         noticeDetail = nil
+        reminderMeetingID = nil
         // The handle exists only while idle: a drag cut short by a turn
         // ends where the panel is.
         if phase != "idle", dragStart != nil {
@@ -3383,6 +3640,31 @@ private final class UntypeOverlayController: ObservableObject {
 
     fileprivate func performRenameAction() {
         noticeRenameAction?()
+    }
+
+    /// A meeting of the calendar starts: its name, Record and Dismiss. The
+    /// model takes the card away (recorded, dismissed, or no longer due).
+    func showReminder(id: String, caption: String, title: String, detail: String) {
+        trayOpen = false
+        show(phase: "reminder")
+        reminderCaption = caption
+        reminderTitle = title
+        reminderDetail = detail
+        reminderMeetingID = id
+    }
+
+    func updateReminderCaption(_ caption: String) {
+        if reminderCaption != caption {
+            reminderCaption = caption
+        }
+    }
+
+    fileprivate func recordReminder() {
+        model?.recordRemindedMeeting()
+    }
+
+    fileprivate func dismissReminder() {
+        model?.dismissReminder()
     }
 
     /// Listening to the spoken name of a meeting: stays until it ends.
@@ -3498,6 +3780,7 @@ private final class UntypeOverlayController: ObservableObject {
         noticeAction = nil
         noticeRenameAction = nil
         noticeDetail = nil
+        reminderMeetingID = nil
         updateCaretIndicator()
         if model?.settings.overlayAlwaysVisible == true || meetingStart != nil {
             if panel?.isVisible != true {
@@ -3961,7 +4244,7 @@ private struct UntypeOverlayView: View {
 
     /// A card (saved, naming) or a notice has the attention.
     private var showsCard: Bool {
-        controller.overlayPhase == "naming" || controller.notice != nil
+        controller.overlayPhase == "naming" || controller.overlayPhase == "reminder" || controller.notice != nil
     }
 
     /// The chips rest (a touch dimmer, still readable on any window behind)
@@ -4223,6 +4506,34 @@ private struct UntypeOverlayView: View {
         .accessibilityLabel([headline, controller.noticeDetail].compactMap { $0 }.joined(separator: ": "))
     }
 
+    /// A meeting of the calendar is on: "Starting now" (then "Started 12 min
+    /// ago"), its name and who is invited; it stays for the whole meeting.
+    /// Record starts recording it, Dismiss puts the card away for good.
+    private var reminderCard: some View {
+        tallCard {
+            VStack(alignment: .leading, spacing: 2) {
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { _ in
+                    HStack(spacing: 5) {
+                        pulsingDot(Self.meetingColor, at: ProcessInfo.processInfo.systemUptime)
+                        cardCaption("\(controller.reminderCaption) · \(controller.reminderDetail)", color: Color.white.opacity(0.75))
+                    }
+                }
+                cardBody(controller.reminderTitle)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(spacing: 4) {
+                pillButton("Record", key: UntypeOverlayController.reminderRecordKey, fill: Self.meetingColor.opacity(0.9), label: "Record this meeting") {
+                    controller.recordReminder()
+                }
+                pillButton("Dismiss", key: UntypeOverlayController.reminderDismissKey, fill: Self.quietFill, label: "Dismiss the reminder") {
+                    controller.dismissReminder()
+                }
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(controller.reminderCaption): \(controller.reminderTitle), \(controller.reminderDetail)")
+    }
+
     /// Naming a meeting by voice: the words appear as they are heard; Done
     /// (Return) uses them, Cancel (Esc) keeps the current name. After that
     /// the card keeps the words while the name is made.
@@ -4386,6 +4697,8 @@ private struct UntypeOverlayView: View {
         VStack(spacing: 6) {
             if controller.overlayPhase == "naming" {
                 namingView
+            } else if controller.overlayPhase == "reminder" {
+                reminderCard
             } else if let notice = controller.notice, controller.noticeAction != nil {
                 savedCard(notice)
             } else if let notice = controller.notice {

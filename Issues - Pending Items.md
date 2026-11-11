@@ -2,6 +2,9 @@
 
 ## Pending Items
 
+### P2 - Outlook calendar reminders and meeting names: on-device check pending (2026-11-11)
+- Plan-055 / FR-61. Checked with unit tests and a live read of the calendar through the `nbg-m365` CLI (times, attendees, filters correct); the overlay card and the naming at stop can only be checked in the app. To check: (1) Settings → General → Meeting recording → turn on **Use my Outlook calendar**: the Calendar line says how many meetings today and the next one; (2) at the start of an accepted or own Teams meeting the overlay shows "Starting now · Teams · N people", the subject, Record and Dismiss; it stays for the whole meeting ("Started N min ago"); Dismiss removes it for good; (3) Record starts the recording, and at stop the card says "Naming it from your calendar…" then the saved card with the calendar title; the transcript starts with the meeting header and the folder holds `meeting.json`; (4) a recording started from the tray during a meeting is named the same way; Rename still replaces the name; (5) holding push-to-talk while the reminder is up dictates normally (`focused_input.ok=true`) and the reminder comes back afterwards.
+
 ### P2 - Meeting cards in the overlay (saved, naming): on-device check pending (2026-11-11)
 - Plan-054 / FR-59. Checked with rendered snapshots (light and dark) and unit tests; the microphone, Soniox and the Return/Esc key tap can only be checked in the app. To check: (1) stop a meeting: the card shows "Meeting saved", the date, Open and Name, and stays while the mouse is on it; (2) Name: the words appear on the card while speaking; Return ends it like Done and the app in front does not receive the Return (try with the cursor in a chat field); Esc cancels like Cancel ("Not renamed"); (3) after Done the card shows "Making the name…" and then "Renamed" with the whole new name and a Rename button; (4) ordinary typing during naming reaches the app in front; (5) push-to-talk still delivers afterwards (`focused_input.ok=true`); (6) the tray (FR-60): its two lines say what a dictation does and change when a chip is switched; with the mouse on a chip or on Record they describe it; the chips are readable at rest on a white window and on a dark one, and a click on a resting chip still toggles it.
 
@@ -30,6 +33,9 @@ Plan-050 / FR-55, released in build 47. Checked only with rendered snapshots. Th
 ### P2 - Screenshot operator: on-device check pending (2026-11-07)
 - Plan-044 is implemented and unit/live-LLM tested (318/318; `deepseek-flash`, `gemini-3.8-flash`, Azure `gpt-5.4` read a rendered window), but the ScreenCaptureKit capture itself can only be checked in the packaged app: it needs the Screen Recording permission for `com.local.untype`. After the next signed build: turn W on, dictate into an app, check Events for `screenshot captured (…)` and `screenshot copied to the clipboard`, paste the clipboard to see the image, and confirm `focused_input.ok=true` in `release-latency.jsonl`.
 - With Clipboard (C) also on, the result text replaces the screenshot on the clipboard at the end of the turn (by design; documented in the configuration guide).
+
+### P3 - `install-local-build.sh` does not relaunch untype (2026-11-11)
+- Builds 50.14 and 50.15: the script quit the running copy and installed the new one, but untype was not running afterwards; it had to be opened with `open -a /Applications/untype.app`. Check the relaunch step of `scripts/install-local-build.sh`.
 
 ### P3 - `settingsExpanded` UI setting is now unused (2026-10-24)
 - Plan-035 replaced the main window's inspector pane with the Settings window, so `UntypeUISettings.settingsExpanded` is still persisted in `ui-state.json` but no longer read. It was kept so existing state files and tests stay valid; remove it together with its patch field when the settings schema is next revised.
