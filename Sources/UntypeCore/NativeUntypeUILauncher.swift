@@ -3877,7 +3877,7 @@ private struct UntypeOverlayView: View {
 
     private static let coordinateSpace = "untype-overlay"
     /// Opacity of the chips while idle and not hovered.
-    private static let restingChipOpacity = 0.7
+    private static let restingChipOpacity = 0.9
 
     @State private var frames: [String: CGRect] = [:]
 
@@ -3964,8 +3964,8 @@ private struct UntypeOverlayView: View {
         controller.overlayPhase == "naming" || controller.notice != nil
     }
 
-    /// The chips rest (dimmer, the ones that are off fainter still) on the
-    /// idle overlay until the mouse opens the tray, and under a card.
+    /// The chips rest (a touch dimmer, still readable on any window behind)
+    /// on the idle overlay until the mouse opens the tray, and under a card.
     private var chipsRest: Bool {
         (isIdle && !controller.trayOpen) || showsCard
     }
@@ -4428,7 +4428,6 @@ private struct UntypeOverlayView: View {
                         controller.toggleOperator(letter: item.label)
                     } label: {
                         operatorChip(item.label, name: item.name, enabled: item.enabled)
-                            .opacity(chipsRest && !item.enabled ? 0.5 : 1)
                     }
                     .buttonStyle(.plain)
                     .contentShape(Capsule(style: .continuous))
@@ -4486,16 +4485,17 @@ private struct UntypeOverlayView: View {
         .accessibilityLabel(isIdle ? "untype operators" : isRecording ? "Push to talk, listening" : "Push to talk, processing")
     }
 
-    /// On: solid amber with a dark letter. Off: a dim outline. Both carry a
+    /// On: solid amber with a dark letter. Off: dark with a white letter and
+    /// a light outline, readable on light and dark windows alike. Both carry a
     /// shadow so they stay readable over any window behind the panel.
     private func operatorChip(_ letter: String, name: String, enabled: Bool) -> some View {
         Text(letter)
             .font(.system(size: 10, weight: .heavy, design: .rounded))
-            .foregroundStyle(enabled ? Color.black.opacity(0.85) : Color.white.opacity(0.75))
+            .foregroundStyle(enabled ? Color.black.opacity(0.85) : Color.white.opacity(0.95))
             .frame(width: 20, height: 16)
             .background(
                 Capsule(style: .continuous)
-                    .fill(enabled ? UntypeDesignTokens.accentAmber : Color.black.opacity(0.35))
+                    .fill(enabled ? UntypeDesignTokens.accentAmber : Color(white: 0.12).opacity(0.72))
             )
             .overlay(
                 Capsule(style: .continuous)

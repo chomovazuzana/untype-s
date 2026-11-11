@@ -9,7 +9,7 @@ The overlay must be very easy to work with, self-explanatory, compact and exact.
 - **After Done.** The card answers at once with "Making the name…" and keeps the words, then becomes the saved card with "Renamed" and the new name.
 
 - **Tray in plain words.** Hovering the chips opens the tray, which says what a dictation does right now ("Refines and translates to English" / "Typed at cursor, copied"). With the mouse on a chip or control the two lines become its name and what it does (the chip's colour already says whether it is on); the chip gets a white ring. Nothing floats over the open tray.
-- **Quiet at rest.** On the idle overlay, and under a card, the chips step back; the operators that are on stay the most visible.
+- **Readable chips.** A chip that is off is dark with a white letter, one that is on is amber; both read on light and dark windows alike, at rest too.
 - **One look.** The tray and the cards share the same dark surface, border and corners.
 - **Human date.** An unnamed meeting shows "Today 22:38" instead of the folder's date stamp.
 
