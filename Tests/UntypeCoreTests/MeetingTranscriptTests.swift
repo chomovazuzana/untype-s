@@ -137,3 +137,22 @@ private func token(_ text: String, final: Bool = true, speaker: String? = nil, l
     #expect(MeetingNaming.sanitize("HR training skills · Mina") == "HR training skills · Mina")
     #expect(MeetingNaming.folderName(current: "2026-11-11 22.59", title: "HR training skills · Mina") == "2026-11-11 22.59 – HR training skills · Mina")
 }
+
+@Test func liveTextKeepsFinalWordsAndReplacesPendingOnes() {
+    var live = MeetingLiveText()
+    #expect(live.add([MeetingToken(text: "Budget", isFinal: false)]) == "Budget")
+    #expect(live.add([MeetingToken(text: "Budget", isFinal: true), MeetingToken(text: " revue", isFinal: false)]) == "Budget revue")
+    #expect(live.add([MeetingToken(text: " review", isFinal: true), MeetingToken(text: "<end>", isFinal: true), MeetingToken(text: "  with Maria", isFinal: false)]) == "Budget review with Maria")
+    #expect(live.add([]) == "Budget review")
+    #expect(live.text == "Budget review")
+}
+
+@Test func friendlyDateReadsTheFolderDateAsPeopleSayIt() throws {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = try #require(TimeZone(identifier: "Europe/Athens"))
+    let now = try #require(calendar.date(from: DateComponents(year: 2026, month: 11, day: 11, hour: 23, minute: 30)))
+    #expect(MeetingNaming.friendlyDate(of: "2026-11-11 22.38", now: now, calendar: calendar) == "Today 22:38")
+    #expect(MeetingNaming.friendlyDate(of: "2026-11-10 09.05 – Budget", now: now, calendar: calendar) == "Yesterday 09:05")
+    #expect(MeetingNaming.friendlyDate(of: "2026-10-02 14.00", now: now, calendar: calendar) == "2 Oct 14:00")
+    #expect(MeetingNaming.friendlyDate(of: "Budget review", now: now, calendar: calendar) == nil)
+}

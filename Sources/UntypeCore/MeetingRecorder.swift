@@ -387,6 +387,10 @@ final class MeetingSonioxStream: @unchecked Sendable {
     private let onSegment: @Sendable (MeetingSegment) -> Void
     private let onSpeech: @Sendable () -> Void
     private let onError: @Sendable (String) -> Void
+    /// The words heard so far, final or not, after every result frame (nil:
+    /// nobody shows them).
+    private let onLiveText: (@Sendable (String) -> Void)?
+    private var liveText = MeetingLiveText()
 
     init(
         side: MeetingSide,
@@ -395,9 +399,11 @@ final class MeetingSonioxStream: @unchecked Sendable {
         offsetMs: Int,
         onSegment: @escaping @Sendable (MeetingSegment) -> Void,
         onSpeech: @escaping @Sendable () -> Void,
-        onError: @escaping @Sendable (String) -> Void
+        onError: @escaping @Sendable (String) -> Void,
+        onLiveText: (@Sendable (String) -> Void)? = nil
     ) {
         self.side = side
+        self.onLiveText = onLiveText
         socket = URLSessionRealtimeWebSocketClient(url: options.endpoint)
         configFrame = Self.configFrame(options: options, side: side, diarize: diarize)
         aggregator = MeetingTokenAggregator(side: side, offsetMs: offsetMs)
@@ -505,7 +511,11 @@ final class MeetingSonioxStream: @unchecked Sendable {
             let parsed = MeetingToken.parse(tokens)
             lock.lock()
             let segments = aggregator.add(parsed)
+            let heard = onLiveText == nil ? nil : liveText.add(parsed)
             lock.unlock()
+            if let heard {
+                onLiveText?(heard)
+            }
             if parsed.contains(where: { !$0.isMarker && !$0.text.trimmingCharacters(in: .whitespaces).isEmpty }) {
                 onSpeech()
             }
@@ -650,6 +660,8 @@ final class MeetingSystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegat
 public final class MeetingNamer {
     public let waveform = UntypeWaveformBuffer()
     public var onDone: (String?) -> Void = { _ in }
+    /// The words heard so far, as they are recognized.
+    public var onHeard: (String) -> Void = { _ in }
     public private(set) var isListening = false
 
     private var microphone: AVFoundationAudioSource?
@@ -696,6 +708,16 @@ public final class MeetingNamer {
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated {
                         Task { await self?.finish() }
+                    }
+                }
+            },
+            onLiveText: { [weak self] text in
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        guard let self, self.isListening, !self.ending else {
+                            return
+                        }
+                        self.onHeard(text)
                     }
                 }
             }

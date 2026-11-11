@@ -84,6 +84,31 @@ public struct MeetingToken: Sendable, Equatable {
     }
 }
 
+/// The words heard so far on one Soniox stream, for showing them while the
+/// user speaks: final tokens accumulate, the non-final ones are replaced by
+/// every result frame.
+public struct MeetingLiveText: Sendable, Equatable {
+    private var finalText = ""
+    public private(set) var text = ""
+
+    public init() {}
+
+    /// Adds the tokens of one result frame; returns the text heard so far.
+    @discardableResult
+    public mutating func add(_ tokens: [MeetingToken]) -> String {
+        var pending = ""
+        for token in tokens where !token.isMarker {
+            if token.isFinal {
+                finalText += token.text
+            } else {
+                pending += token.text
+            }
+        }
+        text = (finalText + pending).split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        return text
+    }
+}
+
 /// Builds segments from the final tokens of one Soniox stream: a segment
 /// ends at an end-of-utterance marker or when the speaker changes. Non-final
 /// tokens are ignored (only what Soniox has settled is written).
@@ -296,6 +321,37 @@ public enum MeetingNaming {
             return nil
         }
         return String(folderName[range])
+    }
+
+    /// The date of a folder name as people say it: "Today 22:38",
+    /// "Yesterday 09:05", "11 Nov 22:38" (nil when the name has no date).
+    public static func friendlyDate(of folderName: String, now: Date = Date(), calendar: Calendar = .current) -> String? {
+        guard let prefix = datePrefix(of: folderName) else {
+            return nil
+        }
+        let parser = DateFormatter()
+        parser.locale = Locale(identifier: "en_US_POSIX")
+        parser.calendar = calendar
+        parser.timeZone = calendar.timeZone
+        parser.dateFormat = "yyyy-MM-dd HH.mm"
+        guard let date = parser.date(from: prefix) else {
+            return nil
+        }
+        let printer = DateFormatter()
+        printer.locale = Locale(identifier: "en_US_POSIX")
+        printer.calendar = calendar
+        printer.timeZone = calendar.timeZone
+        printer.dateFormat = "HH:mm"
+        let time = printer.string(from: date)
+        let days = calendar.dateComponents([.day], from: calendar.startOfDay(for: date), to: calendar.startOfDay(for: now)).day
+        if days == 0 {
+            return "Today \(time)"
+        }
+        if days == 1 {
+            return "Yesterday \(time)"
+        }
+        printer.dateFormat = "d MMM HH:mm"
+        return printer.string(from: date)
     }
 
     /// A title safe as a file name: no path or reserved characters, no

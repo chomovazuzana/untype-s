@@ -1946,6 +1946,9 @@ final class UntypeUIModel: ObservableObject {
         meetingNamer.onDone = { [weak self] spoken in
             self?.namingHeard(spoken)
         }
+        meetingNamer.onHeard = { [weak self] text in
+            self?.overlay?.setNamingHeard(text)
+        }
         overlay?.showNaming()
         Task { [weak self] in
             do {
@@ -1973,7 +1976,7 @@ final class UntypeUIModel: ObservableObject {
             showSavedNotice(folder, headline: "Not renamed")
             return
         }
-        overlay?.showNotice("Naming the meeting…", seconds: 30)
+        overlay?.showNamingWorking(heard: spoken)
         Task { [weak self] in
             let title = await MeetingNamer.title(from: spoken, llm: llm)
             guard let self else {
@@ -1984,7 +1987,7 @@ final class UntypeUIModel: ObservableObject {
                 lastMeetingFolder = renamed
                 namingFolder = nil
                 appendEvent("diagnostic.info: [untype] meeting named: \(renamed.lastPathComponent)")
-                showSavedNotice(renamed, headline: "Named")
+                showSavedNotice(renamed, headline: "Renamed")
             } catch {
                 appendEvent("diagnostic.warning: [untype] meeting could not be renamed: \(error.localizedDescription)")
                 overlay?.showNotice("Could not rename the meeting — see Events")
@@ -1992,16 +1995,18 @@ final class UntypeUIModel: ObservableObject {
         }
     }
 
-    /// The saved card: the headline, the meeting's name, Open and ✎ Name.
+    /// The saved card: what happened, the meeting's name in full (its date
+    /// until it has one), Open and Name / Rename.
     private func showSavedNotice(_ folder: URL, headline: String) {
         let transcript = MeetingNaming.mainTranscript(in: folder)
         let name = folder.lastPathComponent
-        let detail = name.components(separatedBy: MeetingNaming.separator).dropFirst().joined(separator: MeetingNaming.separator)
-        overlay?.showNotice(headline, detail: detail.isEmpty ? name : detail, seconds: 10, action: {
+        let title = name.components(separatedBy: MeetingNaming.separator).dropFirst().joined(separator: MeetingNaming.separator)
+        let shown = title.isEmpty ? (MeetingNaming.friendlyDate(of: name) ?? name) : title
+        overlay?.showNotice(headline, detail: shown, seconds: 12, action: {
             NSWorkspace.shared.open(transcript)
         }, renameAction: { [weak self] in
             self?.nameMeeting(folder)
-        })
+        }, renameLabel: title.isEmpty ? "Name" : "Rename")
     }
 
     func openMeetingsFolder() {
@@ -3168,7 +3173,16 @@ private final class UntypeOverlayController: ObservableObject {
     private var panel: NSPanel?
     private var hideTask: Task<Void, Never>?
     private let layout = UntypeOverlayLayout()
-    @Published private var phase = "idle"
+    @Published private var phase = "idle" {
+        didSet {
+            // Return and Esc belong to the app in front again as soon as
+            // the overlay stops listening to a meeting's name.
+            if phase != "naming" {
+                namingKeys.stop()
+                namingKeysActive = false
+            }
+        }
+    }
     /// The processing line next to the text caret (shown while finalizing,
     /// where the focused control reports its caret).
     private let caretIndicator = CaretIndicatorController()
@@ -3201,8 +3215,27 @@ private final class UntypeOverlayController: ObservableObject {
     @Published fileprivate private(set) var noticeAction: (() -> Void)?
     /// The second line of a link notice (the meeting's name).
     @Published fileprivate private(set) var noticeDetail: String?
-    /// ✎ next to the notice link (nil: no ✎).
+    /// Name / Rename on the saved card (nil: no such button).
     @Published fileprivate private(set) var noticeRenameAction: (() -> Void)?
+    /// That button's word: "Name" until the meeting has a name, then "Rename".
+    @Published fileprivate private(set) var noticeRenameLabel = "Name"
+    /// The words heard so far while naming a meeting.
+    @Published fileprivate private(set) var namingHeard = ""
+    /// Listening has ended; the name is being made from the words.
+    @Published fileprivate private(set) var namingWorking = false
+    /// Cancel was chosen; the listening is being closed.
+    @Published fileprivate private(set) var namingCancelling = false
+    /// Return confirms and Esc cancels while naming (the keys are caught).
+    @Published fileprivate private(set) var namingKeysActive = false
+    private lazy var namingKeys = UntypeNamingKeyTap { [weak self] confirm in
+        dispatchToUI { [weak self] in
+            if confirm {
+                self?.finishNaming()
+            } else {
+                self?.cancelNaming()
+            }
+        }
+    }
     private var displayedNamingGain: Float = 1
     private var lastNamingTraceUpdate: TimeInterval?
     private var displayedMeetingGain: Float = 1
@@ -3331,12 +3364,20 @@ private final class UntypeOverlayController: ObservableObject {
 
     /// Shows the pill with `text` (and the operator chips) for a moment;
     /// with an `action`, the pill is a link that runs it.
-    func showNotice(_ text: String, detail: String? = nil, seconds: Double = 2.5, action: (() -> Void)? = nil, renameAction: (() -> Void)? = nil) {
+    func showNotice(
+        _ text: String,
+        detail: String? = nil,
+        seconds: Double = 2.5,
+        action: (() -> Void)? = nil,
+        renameAction: (() -> Void)? = nil,
+        renameLabel: String = "Name"
+    ) {
         show(phase: "notice")
         notice = text
         noticeDetail = detail
         noticeAction = action
         noticeRenameAction = renameAction
+        noticeRenameLabel = renameLabel
         hideAfterDelay(nanoseconds: UInt64(seconds * 1_000_000_000))
     }
 
@@ -3345,17 +3386,59 @@ private final class UntypeOverlayController: ObservableObject {
     }
 
     /// Listening to the spoken name of a meeting: stays until it ends.
+    /// Return confirms and Esc cancels, like the card's two buttons.
     func showNaming() {
         show(phase: "naming")
+        namingHeard = ""
+        namingWorking = false
+        namingCancelling = false
         displayedNamingGain = 1
         lastNamingTraceUpdate = nil
+        namingKeysActive = namingKeys.start()
     }
 
+    /// The words recognized so far, shown on the naming card as they come.
+    func setNamingHeard(_ text: String) {
+        guard phase == "naming", !namingWorking, namingHeard != text else {
+            return
+        }
+        namingHeard = text
+    }
+
+    /// Listening is over: the card keeps the words and says the name is
+    /// being made (until the saved card replaces it).
+    func showNamingWorking(heard: String) {
+        if phase != "naming" {
+            show(phase: "naming")
+        }
+        namingHeard = heard
+        namingCancelling = false
+        beginNamingWork()
+        hideAfterDelay(nanoseconds: 30_000_000_000)
+    }
+
+    private func beginNamingWork() {
+        namingWorking = true
+        namingKeys.stop()
+        namingKeysActive = false
+    }
+
+    /// Done (or Return): the card answers at once, before the last words
+    /// come back from the recognizer.
     fileprivate func finishNaming() {
+        guard phase == "naming", !namingWorking else {
+            return
+        }
+        beginNamingWork()
         model?.finishMeetingNaming()
     }
 
     fileprivate func cancelNaming() {
+        guard phase == "naming", !namingWorking else {
+            return
+        }
+        namingCancelling = true
+        beginNamingWork()
         model?.cancelMeetingNaming()
     }
 
@@ -3395,7 +3478,15 @@ private final class UntypeOverlayController: ObservableObject {
                 return
             }
             dispatchToUI { [weak self] in
-                self?.hideNow()
+                guard let self else {
+                    return
+                }
+                // A card with buttons stays while the mouse is on it.
+                if noticeAction != nil, pointerInside {
+                    hideAfterDelay(nanoseconds: 2_000_000_000)
+                    return
+                }
+                hideNow()
             }
         }
     }
@@ -3420,6 +3511,7 @@ private final class UntypeOverlayController: ObservableObject {
 
     func destroy() {
         hideTask?.cancel()
+        namingKeys.stop()
         caretIndicator.stop()
         stopFollowingMouse()
         panel?.close()
@@ -3675,6 +3767,25 @@ private final class UntypeOverlayController: ObservableObject {
         ]
     }
 
+    /// What a dictation does with the operators as they are now.
+    fileprivate var summary: UntypeOverlaySummary? {
+        guard let settings = model?.settings else {
+            return nil
+        }
+        return UntypeOverlaySummary(
+            refine: settings.refine,
+            translate: settings.translate,
+            ask: settings.ask,
+            followup: settings.followup,
+            selection: settings.selection,
+            alternative: settings.alternative,
+            screenshot: settings.screenshot,
+            clipboard: settings.clipboard,
+            focusedInput: settings.focusedInput,
+            translationPolicy: settings.translationPolicy
+        )
+    }
+
     /// A click on an operator chip: the same as its key while holding
     /// push-to-talk.
     fileprivate func toggleOperator(letter: String) {
@@ -3825,18 +3936,8 @@ private struct UntypeOverlayView: View {
         if controller.hoveredChip == UntypeOverlayController.settingsKey {
             return ("Settings", nil)
         }
-        if controller.hoveredChip == UntypeOverlayController.noticeKey {
-            return ("Open the transcript", nil)
-        }
-        if controller.hoveredChip == UntypeOverlayController.renameKey {
-            return ("Name it", "Say the topic and who it was with")
-        }
-        if controller.hoveredChip == UntypeOverlayController.namingDoneKey {
-            return ("Done", nil)
-        }
-        if controller.hoveredChip == UntypeOverlayController.namingCancelKey {
-            return ("Cancel", nil)
-        }
+        // The cards' buttons are labelled (and show their key): a tooltip
+        // would only cover the card.
         if controller.hoveredChip == UntypeOverlayController.meetingKey {
             return isMeeting
                 ? ("Stop meeting recording", "Saves the transcript")
@@ -3858,9 +3959,31 @@ private struct UntypeOverlayView: View {
         controller.overlayPhase.lowercased() == "idle" && controller.trayOpen
     }
 
-    /// The idle overlay rests a little dimmer until the mouse is over it.
+    /// A card (saved, naming) or a notice has the attention.
+    private var showsCard: Bool {
+        controller.overlayPhase == "naming" || controller.notice != nil
+    }
+
+    /// The chips rest (dimmer, the ones that are off fainter still) on the
+    /// idle overlay until the mouse opens the tray, and under a card.
+    private var chipsRest: Bool {
+        (isIdle && !controller.trayOpen) || showsCard
+    }
+
     private var chipOpacity: Double {
-        isIdle && !controller.trayOpen ? Self.restingChipOpacity : 1
+        chipsRest ? Self.restingChipOpacity : 1
+    }
+
+    /// The tray's two lines: the control under the mouse (what it is, what
+    /// it does), otherwise what a dictation does now.
+    private var trayStatus: (title: String, detail: String?)? {
+        if let item = hoveredChip {
+            return (item.name, Self.operatorHints[item.label])
+        }
+        if let tooltip {
+            return tooltip
+        }
+        return controller.summary.map { ($0.action, $0.detail) }
     }
 
     /// The tooltip's top-left corner: centred over the hovered chip (under
@@ -3992,64 +4115,213 @@ private struct UntypeOverlayView: View {
         .accessibilityLabel("Recording a meeting")
     }
 
-    /// Saved (or named): check, what was saved, Open and Name.
-    private func savedCard(_ headline: String) -> some View {
-        card {
-            Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(Self.savedColor)
-            cardText(headline, controller.noticeDetail)
-                .frame(maxWidth: 128, alignment: .leading)
-            roundButton("doc.text", key: UntypeOverlayController.noticeKey, fill: Color.white.opacity(0.14), label: "Open the transcript") {
-                controller.performNoticeAction()
-            }
-            if controller.noticeRenameAction != nil {
-                roundButton("pencil", key: UntypeOverlayController.renameKey, fill: Color.white.opacity(0.14), label: "Name the meeting by voice") {
-                    controller.performRenameAction()
-                }
-            }
+    /// The taller card (saved, naming): room for two lines of text next to
+    /// two stacked, labelled buttons.
+    private func tallCard<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        HStack(spacing: 8) {
+            content()
         }
+        .padding(.leading, 11)
+        .padding(.trailing, 5)
+        .frame(height: 51)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color(white: 0.08).opacity(0.94)))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Color.white.opacity(0.10), lineWidth: 1))
+        .padding(.horizontal, 3)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    /// Listening to the meeting's name: pulsing blue dot, level bars, ✓ ✕.
-    private var namingView: some View {
-        card {
-            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { _ in
-                let now = ProcessInfo.processInfo.systemUptime
-                let count = Int(Self.visibleSeconds * UntypeWaveformBuffer.pointsPerSecond)
-                HStack(spacing: 7) {
-                    pulsingDot(Self.traceColor, at: now)
-                    cardText("Listening…", "Topic and people")
-                        .frame(width: 84, alignment: .leading)
-                    levelBars(controller.namingTrace(count: count, at: now), color: Self.traceColor, bars: 12)
-                        .frame(width: 48, height: 18)
+    /// A small status line (what the card is about) over its main text.
+    private func cardCaption(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+            .foregroundStyle(color)
+            .lineLimit(1)
+    }
+
+    /// The card's main text: up to two lines, shrinking a little before it
+    /// is cut, so a name is read in full.
+    private func cardBody(_ text: String, color: Color = .white, truncation: Text.TruncationMode = .tail) -> some View {
+        Text(text)
+            .font(.system(size: 11, weight: .semibold, design: .rounded))
+            .foregroundStyle(color)
+            .lineLimit(2)
+            .minimumScaleFactor(0.82)
+            .truncationMode(truncation)
+            .multilineTextAlignment(.leading)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// A labelled button of the tall cards, with the key that does the same
+    /// (`keySymbol`, an SF Symbol, or `keyText`).
+    private func pillButton(
+        _ title: String,
+        keySymbol: String? = nil,
+        keyText: String? = nil,
+        key: String,
+        fill: Color,
+        label: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        let hovered = controller.hoveredChip == key
+        return Button(action: action) {
+            HStack(spacing: 3) {
+                Text(title)
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundStyle(Color.white)
+                if let keySymbol {
+                    Image(systemName: keySymbol)
+                        .font(.system(size: 7.5, weight: .heavy))
+                        .foregroundStyle(Color.white.opacity(0.7))
+                }
+                if let keyText {
+                    Text(keyText)
+                        .font(.system(size: 8, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Color.white.opacity(0.6))
                 }
             }
-            roundButton("checkmark", key: UntypeOverlayController.namingDoneKey, fill: Self.savedColor.opacity(0.9), label: "Done") {
-                controller.finishNaming()
+            .frame(width: 62, height: 19)
+            .background(Capsule(style: .continuous).fill(fill))
+            .overlay(Capsule(style: .continuous).fill(Color.white.opacity(hovered ? 0.16 : 0)))
+        }
+        .buttonStyle(.plain)
+        .contentShape(Capsule(style: .continuous))
+        .background(hitFrame(key))
+        .accessibilityLabel(label)
+    }
+
+    private static let quietFill = Color.white.opacity(0.14)
+
+    /// Saved or renamed: what happened, the meeting's name in full, Open and
+    /// Name / Rename.
+    private func savedCard(_ headline: String) -> some View {
+        tallCard {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundStyle(Self.savedColor)
+                    cardCaption(headline, color: Self.savedColor)
+                }
+                if let name = controller.noticeDetail {
+                    cardBody(name)
+                }
             }
-            roundButton("xmark", key: UntypeOverlayController.namingCancelKey, fill: Color.white.opacity(0.14), label: "Cancel") {
-                controller.cancelNaming()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(spacing: 4) {
+                pillButton("Open", key: UntypeOverlayController.noticeKey, fill: Self.quietFill, label: "Open the transcript") {
+                    controller.performNoticeAction()
+                }
+                if controller.noticeRenameAction != nil {
+                    let word = controller.noticeRenameLabel
+                    pillButton(word, key: UntypeOverlayController.renameKey, fill: Self.quietFill, label: "\(word) the meeting by voice") {
+                        controller.performRenameAction()
+                    }
+                }
             }
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel([headline, controller.noticeDetail].compactMap { $0 }.joined(separator: ": "))
+    }
+
+    /// Naming a meeting by voice: the words appear as they are heard; Done
+    /// (Return) uses them, Cancel (Esc) keeps the current name. After that
+    /// the card keeps the words while the name is made.
+    private var namingView: some View {
+        let heard = controller.namingHeard
+        let busy = controller.namingWorking
+        return tallCard {
+            VStack(alignment: .leading, spacing: 2) {
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { _ in
+                    let now = ProcessInfo.processInfo.systemUptime
+                    let count = Int(Self.visibleSeconds * UntypeWaveformBuffer.pointsPerSecond)
+                    HStack(spacing: 5) {
+                        pulsingDot(busy ? UntypeDesignTokens.accentAmber : Self.traceColor, at: now)
+                        if busy {
+                            cardCaption(controller.namingCancelling ? "Cancelling…" : "Making the name…", color: Color.white.opacity(0.75))
+                        } else {
+                            cardCaption("Listening", color: Color.white.opacity(0.75))
+                            levelBars(controller.namingTrace(count: count, at: now), color: Self.traceColor, bars: 12)
+                                .frame(width: 44, height: 10)
+                        }
+                    }
+                }
+                if heard.isEmpty {
+                    cardBody(busy ? "…" : "Say the topic and who was there", color: Color.white.opacity(0.55))
+                } else {
+                    // The newest words stay in view.
+                    cardBody(heard, truncation: .head)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if !busy {
+                VStack(spacing: 4) {
+                    pillButton(
+                        "Done",
+                        keySymbol: controller.namingKeysActive ? "return" : nil,
+                        key: UntypeOverlayController.namingDoneKey,
+                        fill: Self.savedColor.opacity(0.85),
+                        label: "Use this name"
+                    ) {
+                        controller.finishNaming()
+                    }
+                    pillButton(
+                        "Cancel",
+                        keyText: controller.namingKeysActive ? "esc" : nil,
+                        key: UntypeOverlayController.namingCancelKey,
+                        fill: Self.quietFill,
+                        label: "Cancel, keep the current name"
+                    ) {
+                        controller.cancelNaming()
+                    }
+                }
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(busy ? "Making the meeting's name" : "Listening to the meeting's name")
     }
 
     /// The tray's dark rounded background; dragging it moves the overlay
     /// (`UntypeOverlayHostingView`).
     private var trayBackground: some View {
-        RoundedRectangle(cornerRadius: 12, style: .continuous)
-            .fill(Color.black.opacity(0.5))
+        RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill(Color(white: 0.08).opacity(0.94))
             .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .strokeBorder(Color.white.opacity(0.14), lineWidth: 1)
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.10), lineWidth: 1)
             )
             .padding(1)
             .accessibilityLabel("Drag to move the overlay, double-click to reset its place")
     }
 
-    /// The tray's top row: translation direction on the left, Settings on
-    /// the right.
+    /// The tray: its row of controls and, under it, two lines that say what
+    /// a dictation does now (or what the control under the mouse is).
     private var trayControls: some View {
+        VStack(spacing: 0) {
+            trayControlRow
+            Spacer(minLength: 0)
+            if let status = trayStatus {
+                VStack(spacing: 1) {
+                    Text(status.title)
+                        .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Color.white)
+                    Text(status.detail ?? " ")
+                        .font(.system(size: 9.5, weight: .medium, design: .rounded))
+                        .foregroundStyle(Color.white.opacity(0.6))
+                }
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+                .padding(.horizontal, 10)
+                .frame(maxWidth: .infinity)
+                .accessibilityElement(children: .combine)
+            }
+        }
+        .padding(.top, 7)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    /// The tray's top row: translation direction on the left, Record and
+    /// Settings on the right.
+    private var trayControlRow: some View {
         HStack(spacing: 4) {
             Text("Translate")
                 .font(.system(size: 9, weight: .semibold, design: .rounded))
@@ -4108,8 +4380,6 @@ private struct UntypeOverlayView: View {
             .accessibilityLabel("Open Settings")
         }
         .padding(.horizontal, 12)
-        .padding(.top, 8)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
     var body: some View {
@@ -4158,6 +4428,7 @@ private struct UntypeOverlayView: View {
                         controller.toggleOperator(letter: item.label)
                     } label: {
                         operatorChip(item.label, name: item.name, enabled: item.enabled)
+                            .opacity(chipsRest && !item.enabled ? 0.5 : 1)
                     }
                     .buttonStyle(.plain)
                     .contentShape(Capsule(style: .continuous))
@@ -4177,7 +4448,9 @@ private struct UntypeOverlayView: View {
         }
         .accessibilityElement(children: .contain)
         .overlay(alignment: .topLeading) {
-            if let tooltip, let anchor = controller.hoveredChip.flatMap({ frames[$0] }) {
+            // The open tray explains the control under the mouse in its
+            // own two lines, so nothing floats over it.
+            if !showsTray, let tooltip, let anchor = controller.hoveredChip.flatMap({ frames[$0] }) {
                 VStack(spacing: 1) {
                     Text(tooltip.title)
                         .font(.system(size: 10, weight: .semibold, design: .rounded))
@@ -4227,6 +4500,10 @@ private struct UntypeOverlayView: View {
             .overlay(
                 Capsule(style: .continuous)
                     .strokeBorder(enabled ? Color.clear : Color.white.opacity(0.45), lineWidth: 1)
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .strokeBorder(Color.white.opacity(controller.hoveredChip == letter ? 0.95 : 0), lineWidth: 1.5)
             )
             .shadow(color: .black.opacity(0.3), radius: 1.5, y: 0.5)
             .accessibilityLabel("\(name) \(enabled ? "on" : "off")")
@@ -5364,6 +5641,105 @@ private final class UntypeQuartzHotkeyEventTap {
         }
         return false
     }
+}
+
+/// Return and Esc while the overlay listens to a meeting's name: caught
+/// before the app in front sees them (the overlay never takes the keyboard
+/// focus), and only for that moment. Independent of the push-to-talk hotkey
+/// monitors; every other key passes through untouched.
+private final class UntypeNamingKeyTap {
+    /// `true`: Return or Enter (confirm); `false`: Esc (cancel).
+    private let onKey: @Sendable (Bool) -> Void
+    private var eventTap: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
+    /// Keys whose press was caught, so their release is caught too.
+    private var caught: Set<Int64> = []
+    private static let returnKeys: Set<Int64> = [36, 76]
+    private static let escapeKey: Int64 = 53
+
+    init(onKey: @escaping @Sendable (Bool) -> Void) {
+        self.onKey = onKey
+    }
+
+    /// False when macOS does not allow the tap: the buttons still work.
+    func start() -> Bool {
+        if eventTap != nil {
+            return true
+        }
+        let mask = CGEventMask(1 << CGEventType.keyDown.rawValue) | CGEventMask(1 << CGEventType.keyUp.rawValue)
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: untypeNamingKeyTapCallback,
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
+        ) else {
+            return false
+        }
+        guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
+            CFMachPortInvalidate(tap)
+            return false
+        }
+        eventTap = tap
+        runLoopSource = source
+        caught = []
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        return true
+    }
+
+    func stop() {
+        if let source = runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+        }
+        if let eventTap {
+            CFMachPortInvalidate(eventTap)
+        }
+        runLoopSource = nil
+        eventTap = nil
+        caught = []
+    }
+
+    /// True when the event is swallowed.
+    fileprivate func handle(type: CGEventType, event: CGEvent) -> Bool {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let eventTap {
+                CGEvent.tapEnable(tap: eventTap, enable: true)
+            }
+            return false
+        }
+        if isUntypeSyntheticKeyboardEvent(event) {
+            return false
+        }
+        let key = event.getIntegerValueField(.keyboardEventKeycode)
+        if type == .keyUp {
+            return caught.remove(key) != nil
+        }
+        guard type == .keyDown, Self.returnKeys.contains(key) || key == Self.escapeKey else {
+            return false
+        }
+        // With a modifier it is some app's shortcut, not an answer.
+        guard event.flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift]).isEmpty else {
+            return false
+        }
+        caught.insert(key)
+        if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+            onKey(key != Self.escapeKey)
+        }
+        return true
+    }
+}
+
+private let untypeNamingKeyTapCallback: CGEventTapCallBack = { _, type, event, userInfo in
+    guard let userInfo else {
+        return Unmanaged.passUnretained(event)
+    }
+    let tap = Unmanaged<UntypeNamingKeyTap>.fromOpaque(userInfo).takeUnretainedValue()
+    if tap.handle(type: type, event: event) {
+        return nil
+    }
+    return Unmanaged.passUnretained(event)
 }
 
 private let untypeHotkeyEventTapCallback: CGEventTapCallBack = { _, type, event, userInfo in
