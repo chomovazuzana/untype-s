@@ -241,6 +241,22 @@ struct UntypeSettingsView: View {
         }
     }
 
+    private func chooseMeetingFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = model.settings.meeting.folderURL
+        panel.prompt = "Use Folder"
+        guard panel.runModal() == .OK, let url = panel.url else {
+            return
+        }
+        var meeting = model.settings.meeting
+        meeting.folder = url.path
+        model.setMeetingPreferences(meeting)
+    }
+
     // MARK: General
 
     @ViewBuilder
@@ -275,7 +291,53 @@ struct UntypeSettingsView: View {
         } header: {
             Text("Dictation overlay")
         } footer: {
-            caption("The overlay shows the waveform and the operator chips. Kept visible, the chips can be clicked at any time. Drag its grip to move it; double-click the grip to reset.")
+            caption("The overlay shows the waveform and the operator chips. Kept visible, the chips can be clicked at any time. Hover it for the tray: drag the tray to move the overlay; double-click it to reset.")
+        }
+
+        Section {
+            Picker("Transcript language", selection: Binding(
+                get: { model.settings.meeting.language },
+                set: { value in
+                    var meeting = model.settings.meeting
+                    meeting.language = value
+                    model.setMeetingPreferences(meeting)
+                }
+            )) {
+                ForEach(MeetingTranscriptLanguage.allCases, id: \.rawValue) { language in
+                    Text(language.title).tag(language.rawValue)
+                }
+            }
+            Stepper(value: Binding(
+                get: { model.settings.meeting.silenceMinutes },
+                set: { value in
+                    var meeting = model.settings.meeting
+                    meeting.silenceMinutes = value
+                    model.setMeetingPreferences(meeting)
+                }
+            ), in: 0...60) {
+                LabeledContent("Auto-stop after silence") {
+                    Text(model.settings.meeting.silenceMinutes == 0 ? "Off" : "\(model.settings.meeting.silenceMinutes) min")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            LabeledContent("Folder") {
+                HStack(spacing: 8) {
+                    Text(model.settings.meeting.folderURL.path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Button("Choose…") {
+                        chooseMeetingFolder()
+                    }
+                    Button("Open") {
+                        model.openMeetingsFolder()
+                    }
+                }
+            }
+        } header: {
+            Text("Meeting recording")
+        } footer: {
+            caption("Hover the overlay and click ⏺ to record both sides of a call (your microphone and the call's sound). Each meeting gets a folder with transcript.txt, transcript.original.txt (as spoken) and transcript.jsonl. Needs Screen & System Audio Recording permission; headphones avoid the call being heard twice.")
         }
 
         Section("Current session") {

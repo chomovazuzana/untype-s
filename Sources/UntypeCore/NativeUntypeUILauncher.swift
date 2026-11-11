@@ -356,6 +356,17 @@ final class UntypeUIModel: ObservableObject {
     private var sessionOwner: UntypeUISessionOwner?
     private var hotkeySessionControl: HotkeySessionControl?
 
+    /// Meeting recording (both sides of a call, separate from push-to-talk).
+    let meetingRecorder = MeetingRecorder()
+    @Published private(set) var meetingRecording = false
+    /// Starting, or saving the transcript after the stop.
+    @Published private(set) var meetingBusy = false
+    @Published private(set) var lastMeetingFolder: URL?
+    /// Listens to the spoken name of a saved meeting.
+    let meetingNamer = MeetingNamer()
+    private var namingFolder: URL?
+    private var namingLLM: LLMConfig?
+
     /// Microphone samples of the current push-to-talk turn, for the overlay trace.
     var microphoneWaveform: UntypeWaveformBuffer? {
         hotkeySessionControl?.waveform
@@ -768,6 +779,19 @@ final class UntypeUIModel: ObservableObject {
             if overlayAlwaysVisible != nil {
                 overlay?.applyAlwaysVisible()
             }
+        } catch {
+            appendEvent("diagnostic.warning: \(error.localizedDescription)")
+        }
+    }
+
+    /// Settings → General → Meeting recording. Nothing else is
+    /// reconfigured; the next meeting uses the new values.
+    func setMeetingPreferences(_ meeting: MeetingPreferences) {
+        do {
+            settings = try settings.merged(UntypeUISettingsPatch(meeting: meeting))
+            try UntypeUISettingsStore.save(settings)
+            overlay?.refreshOperators()
+            appendEvent("config.saved: meeting recording settings")
         } catch {
             appendEvent("diagnostic.warning: \(error.localizedDescription)")
         }
@@ -1845,6 +1869,176 @@ final class UntypeUIModel: ObservableObject {
             audioStatus = label
             appendAudioActivityEvent(snapshot, label: label)
         }
+    }
+
+    /// The overlay's and the dropdown's record button: starts a meeting
+    /// recording, or stops the one in progress and saves its transcript.
+    func toggleMeetingRecording() {
+        if meetingRecorder.isRecording {
+            meetingBusy = true
+            overlay?.showNotice("Saving the meeting transcript…")
+            Task { await meetingRecorder.stop(reason: .user) }
+            return
+        }
+        guard !meetingBusy else {
+            return
+        }
+        let options: MeetingRecordingOptions
+        do {
+            options = try meetingOptions()
+        } catch {
+            meetingStartFailed(error)
+            return
+        }
+        meetingBusy = true
+        // The red trace shows at once; the audio fills it as soon as the
+        // capture runs.
+        overlay?.setMeeting(start: Date())
+        meetingRecorder.onEvent = { [weak self] line in
+            self?.appendEvent(line)
+        }
+        meetingRecorder.onFinished = { [weak self] reason, folder in
+            self?.meetingFinished(reason: reason, folder: folder)
+        }
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+            do {
+                try await meetingRecorder.start(options: options)
+                meetingBusy = false
+                meetingRecording = true
+                overlay?.setMeeting(start: meetingRecorder.startDate)
+            } catch {
+                meetingBusy = false
+                overlay?.setMeeting(start: nil)
+                meetingStartFailed(error)
+            }
+        }
+    }
+
+    private func meetingOptions() throws -> MeetingRecordingOptions {
+        let config = try ConfigResolver(requireProtocolOutputForHybrid: false).resolve(argv: try settings.sessionArguments())
+        return try MeetingRecordingOptions(
+            config: config,
+            folderRoot: settings.meeting.folderURL,
+            silenceMinutes: settings.meeting.silenceMinutes,
+            language: try settings.meeting.transcriptLanguage
+        )
+    }
+
+    /// ✎ on the saved notice: listen to a description of the meeting, turn
+    /// it into a short title and rename the folder and its transcript.
+    func nameMeeting(_ folder: URL) {
+        guard !meetingNamer.isListening else {
+            return
+        }
+        let options: MeetingRecordingOptions
+        do {
+            options = try meetingOptions()
+        } catch {
+            appendEvent("diagnostic.warning: [untype] meeting naming could not start: \(error.localizedDescription)")
+            overlay?.showNotice("Naming could not start — see Events")
+            return
+        }
+        namingFolder = folder
+        namingLLM = options.llm
+        meetingNamer.onDone = { [weak self] spoken in
+            self?.namingHeard(spoken)
+        }
+        overlay?.showNaming()
+        Task { [weak self] in
+            do {
+                try await self?.meetingNamer.start(options: options)
+            } catch {
+                self?.appendEvent("diagnostic.warning: [untype] meeting naming could not start: \(error.localizedDescription)")
+                self?.overlay?.showNotice("Naming could not start — see Events")
+            }
+        }
+    }
+
+    func finishMeetingNaming() {
+        Task { await meetingNamer.finish() }
+    }
+
+    func cancelMeetingNaming() {
+        Task { await meetingNamer.cancel() }
+    }
+
+    private func namingHeard(_ spoken: String?) {
+        guard let folder = namingFolder else {
+            return
+        }
+        guard let spoken, let llm = namingLLM else {
+            showSavedNotice(folder, headline: "Not renamed")
+            return
+        }
+        overlay?.showNotice("Naming the meeting…", seconds: 30)
+        Task { [weak self] in
+            let title = await MeetingNamer.title(from: spoken, llm: llm)
+            guard let self else {
+                return
+            }
+            do {
+                let renamed = try MeetingNaming.rename(folder: folder, title: title)
+                lastMeetingFolder = renamed
+                namingFolder = nil
+                appendEvent("diagnostic.info: [untype] meeting named: \(renamed.lastPathComponent)")
+                showSavedNotice(renamed, headline: "Named")
+            } catch {
+                appendEvent("diagnostic.warning: [untype] meeting could not be renamed: \(error.localizedDescription)")
+                overlay?.showNotice("Could not rename the meeting — see Events")
+            }
+        }
+    }
+
+    /// The saved card: the headline, the meeting's name, Open and ✎ Name.
+    private func showSavedNotice(_ folder: URL, headline: String) {
+        let transcript = MeetingNaming.mainTranscript(in: folder)
+        let name = folder.lastPathComponent
+        let detail = name.components(separatedBy: MeetingNaming.separator).dropFirst().joined(separator: MeetingNaming.separator)
+        overlay?.showNotice(headline, detail: detail.isEmpty ? name : detail, seconds: 10, action: {
+            NSWorkspace.shared.open(transcript)
+        }, renameAction: { [weak self] in
+            self?.nameMeeting(folder)
+        })
+    }
+
+    func openMeetingsFolder() {
+        let folder = lastMeetingFolder ?? settings.meeting.folderURL
+        try? FileManager.default.createDirectory(at: settings.meeting.folderURL, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(folder)
+    }
+
+    private func meetingStartFailed(_ error: Error) {
+        let message = error.localizedDescription
+        appendEvent("diagnostic.warning: [untype] meeting recording could not start: \(message)")
+        if case MeetingError.screenRecordingPermission = error {
+            overlay?.showNotice("Allow Screen & System Audio Recording for untype, then try again")
+        } else {
+            overlay?.showNotice("Meeting recording could not start — see Events")
+        }
+    }
+
+    private func meetingFinished(reason: MeetingStopReason, folder: URL?) {
+        meetingBusy = false
+        meetingRecording = false
+        lastMeetingFolder = folder ?? lastMeetingFolder
+        overlay?.setMeeting(start: nil)
+        let headline: String
+        switch reason {
+        case .user:
+            headline = "Meeting saved"
+        case .silence(let minutes):
+            headline = "Ended · \(minutes) min silence"
+        case .failure:
+            headline = "Stopped by an error"
+        }
+        guard let folder, FileManager.default.fileExists(atPath: MeetingNaming.mainTranscript(in: folder).path) else {
+            overlay?.showNotice(headline)
+            return
+        }
+        showSavedNotice(folder, headline: headline)
     }
 
     fileprivate func appendEvent(_ line: String) {
@@ -2995,6 +3189,24 @@ private final class UntypeOverlayController: ObservableObject {
     /// The mouse is over the overlay (anywhere in its frame): the idle
     /// overlay brightens its chips and shows the drag handle.
     @Published fileprivate private(set) var pointerInside = false
+    /// Start of the meeting being recorded (nil: none): the idle overlay
+    /// then draws the meeting audio in red and stays on screen.
+    @Published fileprivate private(set) var meetingStart: Date?
+    /// The hover tray is open: it opens when the mouse is on an operator
+    /// chip of the idle overlay and closes when the mouse leaves the overlay
+    /// (or ⏺ starts a meeting, so the red trace shows at once). The empty
+    /// area above the chips never opens it, so it stays click-through.
+    @Published fileprivate private(set) var trayOpen = false
+    /// What a click on the notice does (nil: the notice is not clickable).
+    @Published fileprivate private(set) var noticeAction: (() -> Void)?
+    /// The second line of a link notice (the meeting's name).
+    @Published fileprivate private(set) var noticeDetail: String?
+    /// ✎ next to the notice link (nil: no ✎).
+    @Published fileprivate private(set) var noticeRenameAction: (() -> Void)?
+    private var displayedNamingGain: Float = 1
+    private var lastNamingTraceUpdate: TimeInterval?
+    private var displayedMeetingGain: Float = 1
+    private var lastMeetingTraceUpdate: TimeInterval?
     /// Follows the mouse while the panel is on screen.
     private var mouseTimer: Timer?
     /// A drag of the handle in progress: where the mouse and the panel
@@ -3005,6 +3217,11 @@ private final class UntypeOverlayController: ObservableObject {
     fileprivate static let handleKey = "tray"
     /// Keys of the tray's controls in `chipFrames`/`hoveredChip`.
     fileprivate static let settingsKey = "settings"
+    fileprivate static let meetingKey = "meeting"
+    fileprivate static let noticeKey = "notice"
+    fileprivate static let renameKey = "rename"
+    fileprivate static let namingDoneKey = "naming.done"
+    fileprivate static let namingCancelKey = "naming.cancel"
     fileprivate static let translationKeyPrefix = "translate:"
 
     init(model: UntypeUIModel) {
@@ -3040,6 +3257,9 @@ private final class UntypeOverlayController: ObservableObject {
         hideTask?.cancel()
         self.phase = phase
         notice = nil
+        noticeAction = nil
+        noticeRenameAction = nil
+        noticeDetail = nil
         // The handle exists only while idle: a drag cut short by a turn
         // ends where the panel is.
         if phase != "idle", dragStart != nil {
@@ -3077,7 +3297,7 @@ private final class UntypeOverlayController: ObservableObject {
         guard phase == "idle" else {
             return
         }
-        if model?.settings.overlayAlwaysVisible == true {
+        if model?.settings.overlayAlwaysVisible == true || meetingStart != nil {
             show(phase: "idle")
         } else {
             hideNow()
@@ -3088,21 +3308,92 @@ private final class UntypeOverlayController: ObservableObject {
         operatorVersion += 1
     }
 
+    /// A meeting recording started (its start) or ended (nil).
+    func setMeeting(start: Date?) {
+        meetingStart = start
+        if start != nil {
+            trayOpen = false
+        }
+        displayedMeetingGain = 1
+        lastMeetingTraceUpdate = nil
+        if start != nil {
+            if panel?.isVisible != true {
+                show(phase: "idle")
+            }
+        } else if phase == "idle", model?.settings.overlayAlwaysVisible != true {
+            hideNow()
+        }
+    }
+
     func refreshTheme() {
         operatorVersion += 1
     }
 
-    /// Shows the pill with `text` (and the operator chips) for a moment.
-    func showNotice(_ text: String) {
+    /// Shows the pill with `text` (and the operator chips) for a moment;
+    /// with an `action`, the pill is a link that runs it.
+    func showNotice(_ text: String, detail: String? = nil, seconds: Double = 2.5, action: (() -> Void)? = nil, renameAction: (() -> Void)? = nil) {
         show(phase: "notice")
         notice = text
-        hideAfterDelay(nanoseconds: 2_500_000_000)
+        noticeDetail = detail
+        noticeAction = action
+        noticeRenameAction = renameAction
+        hideAfterDelay(nanoseconds: UInt64(seconds * 1_000_000_000))
+    }
+
+    fileprivate func performRenameAction() {
+        noticeRenameAction?()
+    }
+
+    /// Listening to the spoken name of a meeting: stays until it ends.
+    func showNaming() {
+        show(phase: "naming")
+        displayedNamingGain = 1
+        lastNamingTraceUpdate = nil
+    }
+
+    fileprivate func finishNaming() {
+        model?.finishMeetingNaming()
+    }
+
+    fileprivate func cancelNaming() {
+        model?.cancelMeetingNaming()
+    }
+
+    fileprivate func namingTrace(count: Int, at time: TimeInterval) -> [Float] {
+        let elapsed = lastNamingTraceUpdate.map { time - $0 } ?? 0
+        lastNamingTraceUpdate = time
+        guard let samples = model?.meetingNamer.waveform.window(count: count, at: time) else {
+            return []
+        }
+        let peak = samples.reduce(Float(0)) { max($0, abs($1)) }
+        displayedNamingGain = UntypeWaveform.smoothed(
+            previous: displayedNamingGain,
+            target: UntypeWaveform.gain(forPeak: peak),
+            elapsed: elapsed
+        )
+        return samples.map { min(1, max(-1, $0 * displayedNamingGain)) }
+    }
+
+    /// The translation targets offered in the tray: the dictation languages
+    /// chosen in Settings.
+    fileprivate var translationLanguages: [String] {
+        model?.settings.languages ?? []
+    }
+
+    fileprivate func performNoticeAction() {
+        let action = noticeAction
+        hideNow()
+        action?()
     }
 
     func hideAfterDelay(nanoseconds: UInt64 = 1_200_000_000) {
         hideTask?.cancel()
         hideTask = Task.detached { [weak self] in
             try? await Task.sleep(nanoseconds: nanoseconds)
+            // A replaced timer (a newer notice) must not hide the overlay.
+            guard !Task.isCancelled else {
+                return
+            }
             dispatchToUI { [weak self] in
                 self?.hideNow()
             }
@@ -3113,8 +3404,11 @@ private final class UntypeOverlayController: ObservableObject {
         hideTask?.cancel()
         phase = "idle"
         notice = nil
+        noticeAction = nil
+        noticeRenameAction = nil
+        noticeDetail = nil
         updateCaretIndicator()
-        if model?.settings.overlayAlwaysVisible == true {
+        if model?.settings.overlayAlwaysVisible == true || meetingStart != nil {
             if panel?.isVisible != true {
                 show(phase: "idle")
             }
@@ -3172,8 +3466,17 @@ private final class UntypeOverlayController: ObservableObject {
         let location = CGPoint(x: mouse.x - frame.minX, y: frame.maxY - mouse.y)
         // A chip or tray control wins; elsewhere on the idle overlay the
         // mouse is on the tray (drawn there while the pointer is inside).
-        let control = chipFrames.first { $0.value.insetBy(dx: -3, dy: -3).contains(location) }?.key
-        setHoveredChip(control ?? (phase == "idle" ? Self.handleKey : nil))
+        // With the tray closed only the chips and the (invisible) Record spot
+        // react; the tray's other controls wait until it is open.
+        let control = chipFrames.first { key, frame in
+            let hidden = !trayOpen && (key.hasPrefix(Self.translationKeyPrefix) || key == Self.settingsKey)
+            return !hidden && frame.insetBy(dx: -3, dy: -3).contains(location)
+        }?.key
+        if phase == "idle", !trayOpen, let control,
+           control.count == 1 || (control == Self.meetingKey && meetingStart == nil) {
+            trayOpen = true
+        }
+        setHoveredChip(control ?? (phase == "idle" && trayOpen ? Self.handleKey : nil))
     }
 
     /// The place the user dragged the overlay to, while it is still on a
@@ -3235,6 +3538,9 @@ private final class UntypeOverlayController: ObservableObject {
             return
         }
         pointerInside = inside
+        if !inside {
+            trayOpen = false
+        }
     }
 
     private func setHoveredChip(_ chip: String?) {
@@ -3318,6 +3624,36 @@ private final class UntypeOverlayController: ObservableObject {
             elapsed: elapsed
         )
         return samples.map { min(1, max(-1, $0 * displayedGain)) }
+    }
+
+    /// One frame of the meeting trace: the microphone and the call's sound
+    /// together, with the same automatic gain as the dictation trace.
+    fileprivate func meetingTrace(count: Int, at time: TimeInterval) -> [Float] {
+        let elapsed = lastMeetingTraceUpdate.map { time - $0 } ?? 0
+        lastMeetingTraceUpdate = time
+        guard let recorder = model?.meetingRecorder else {
+            return []
+        }
+        let mic = recorder.micWaveform.window(count: count, at: time)
+        let call = recorder.callWaveform.window(count: count, at: time)
+        let samples = (0..<max(mic.count, call.count)).map { index in
+            (index < mic.count ? mic[index] : 0) + (index < call.count ? call[index] : 0)
+        }
+        let peak = samples.reduce(Float(0)) { max($0, abs($1)) }
+        displayedMeetingGain = UntypeWaveform.smoothed(
+            previous: displayedMeetingGain,
+            target: UntypeWaveform.gain(forPeak: peak),
+            elapsed: elapsed
+        )
+        return samples.map { min(1, max(-1, $0 * displayedMeetingGain)) }
+    }
+
+    fileprivate var meetingSilenceMinutes: Int {
+        model?.settings.meeting.silenceMinutes ?? MeetingPreferences.defaultSilenceMinutes
+    }
+
+    fileprivate func toggleMeeting() {
+        model?.toggleMeetingRecording()
     }
 
     /// The operators the user can toggle while holding push-to-talk (R/T/A/F/S/L/W/C/I
@@ -3466,17 +3802,45 @@ private struct UntypeOverlayView: View {
     ]
 
     /// The tray's translation-direction buttons: short label, tooltip.
-    private static let translationChoices: [(policy: TranslationPolicy, label: String, title: String, detail: String)] = [
-        (.opposite, "⇄", "Opposite language", "Greek becomes English, English becomes Greek"),
-        (.toEnglish, "EN", "To English", "Translate always turns the text into English"),
-        (.toGreek, "EL", "To Greek", "Translate always turns the text into Greek")
+    private static let translationChoices: [(policy: TranslationPolicy, language: String, label: String, title: String, detail: String)] = [
+        (.toEnglish, "en", "EN", "To English", "Translate turns the text into English"),
+        (.toGreek, "el", "EL", "To Greek", "Translate turns the text into Greek")
     ]
 
-    /// The tooltip: the operator's name and key, and what it does (or the
+    /// The targets for the languages chosen in Settings (both with "auto").
+    private var offeredTranslationChoices: [(policy: TranslationPolicy, language: String, label: String, title: String, detail: String)] {
+        let languages = controller.translationLanguages
+        return Self.translationChoices.filter { languages.contains($0.language) || languages.contains("auto") }
+    }
+
+    private static let meetingColor = Color(.sRGB, red: 0.92, green: 0.26, blue: 0.24, opacity: 1)
+
+    private var isMeeting: Bool {
+        controller.meetingStart != nil
+    }
+
+    /// The tooltip: the operator's name and what it does (or the
     /// tray control under the mouse).
     private var tooltip: (title: String, detail: String?)? {
         if controller.hoveredChip == UntypeOverlayController.settingsKey {
             return ("Settings", nil)
+        }
+        if controller.hoveredChip == UntypeOverlayController.noticeKey {
+            return ("Open the transcript", nil)
+        }
+        if controller.hoveredChip == UntypeOverlayController.renameKey {
+            return ("Name it", "Say the topic and who it was with")
+        }
+        if controller.hoveredChip == UntypeOverlayController.namingDoneKey {
+            return ("Done", nil)
+        }
+        if controller.hoveredChip == UntypeOverlayController.namingCancelKey {
+            return ("Cancel", nil)
+        }
+        if controller.hoveredChip == UntypeOverlayController.meetingKey {
+            return isMeeting
+                ? ("Stop meeting recording", "Saves the transcript")
+                : ("Record meeting", "Both sides of the call · stops after \(controller.meetingSilenceMinutes) min of silence")
         }
         if let key = controller.hoveredChip, key.hasPrefix(UntypeOverlayController.translationKeyPrefix),
            let choice = Self.translationChoices.first(where: { UntypeOverlayController.translationKeyPrefix + $0.policy.rawValue == key }) {
@@ -3485,18 +3849,18 @@ private struct UntypeOverlayView: View {
         guard let item = hoveredChip else {
             return nil
         }
-        return ("\(item.name) · \(item.label)", Self.operatorHints[item.label])
+        return (item.name, Self.operatorHints[item.label])
     }
 
     /// The hover tray appears only on an idle overlay under the mouse:
     /// while dictating or processing, the overlay is not moved or set up.
     private var showsTray: Bool {
-        controller.overlayPhase.lowercased() == "idle" && controller.pointerInside
+        controller.overlayPhase.lowercased() == "idle" && controller.trayOpen
     }
 
     /// The idle overlay rests a little dimmer until the mouse is over it.
     private var chipOpacity: Double {
-        isIdle && !controller.pointerInside ? Self.restingChipOpacity : 1
+        isIdle && !controller.trayOpen ? Self.restingChipOpacity : 1
     }
 
     /// The tooltip's top-left corner: centred over the hovered chip (under
@@ -3521,6 +3885,155 @@ private struct UntypeOverlayView: View {
         }
     }
 
+    // MARK: Cards (recording a meeting, saved, naming)
+
+    private static let savedColor = Color(.sRGB, red: 0.30, green: 0.80, blue: 0.46, opacity: 1)
+
+    /// The shared card: one dark pill holding a status and its buttons.
+    private func card<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        HStack(spacing: 7) {
+            content()
+        }
+        .padding(.leading, 12)
+        .padding(.trailing, 6)
+        .frame(height: 36)
+        .background(Capsule(style: .continuous).fill(Color(white: 0.08).opacity(0.94)))
+        .overlay(Capsule(style: .continuous).strokeBorder(Color.white.opacity(0.10), lineWidth: 1))
+        .shadow(color: .black.opacity(0.35), radius: 6, y: 2)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// A softly pulsing status dot.
+    private func pulsingDot(_ color: Color, at time: TimeInterval) -> some View {
+        Circle()
+            .fill(color)
+            .frame(width: 7, height: 7)
+            .opacity(0.55 + 0.45 * (0.5 + 0.5 * sin(time * 4)))
+            .shadow(color: color.opacity(0.7), radius: 3)
+    }
+
+    /// The trace as a few rounded level bars, centred on the middle line.
+    private func levelBars(_ trace: [Float], color: Color, bars: Int = 16) -> some View {
+        Canvas { canvas, size in
+            guard trace.count >= bars else {
+                return
+            }
+            let width: CGFloat = 2.5
+            let gap = (size.width - CGFloat(bars) * width) / CGFloat(bars - 1)
+            let bucket = trace.count / bars
+            for index in 0..<bars {
+                let slice = trace[(index * bucket)..<((index + 1) * bucket)]
+                let level = CGFloat(slice.reduce(Float(0)) { max($0, abs($1)) })
+                let height = max(3, level * size.height)
+                let rect = CGRect(x: CGFloat(index) * (width + gap), y: (size.height - height) / 2, width: width, height: height)
+                canvas.fill(Path(roundedRect: rect, cornerRadius: width / 2), with: .color(color))
+            }
+        }
+    }
+
+    /// Headline and a dimmer second line.
+    private func cardText(_ headline: String, _ detail: String?) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(headline)
+                .font(.system(size: 11, weight: .semibold, design: .rounded).monospacedDigit())
+                .foregroundStyle(Color.white)
+            if let detail {
+                Text(detail)
+                    .font(.system(size: 9.5, weight: .medium, design: .rounded))
+                    .foregroundStyle(Color.white.opacity(0.6))
+            }
+        }
+        .lineLimit(1)
+        .truncationMode(.tail)
+    }
+
+    private func roundButton(_ symbol: String, key: String, fill: Color, label: String, action: @escaping () -> Void) -> some View {
+        let hovered = controller.hoveredChip == key
+        return Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 9.5, weight: .heavy))
+                .foregroundStyle(Color.white)
+                .frame(width: 24, height: 24)
+                .background(Circle().fill(fill))
+                .overlay(Circle().fill(Color.white.opacity(hovered ? 0.18 : 0)))
+        }
+        .buttonStyle(.plain)
+        .contentShape(Circle())
+        .background(hitFrame(key))
+        .accessibilityLabel(label)
+    }
+
+    private static func elapsed(_ seconds: Int) -> String {
+        seconds >= 3600
+            ? String(format: "%d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
+            : String(format: "%d:%02d", seconds / 60, seconds % 60)
+    }
+
+    /// Recording a meeting: pulsing red dot, elapsed time, level bars, stop.
+    private var meetingCard: some View {
+        card {
+            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+                let now = ProcessInfo.processInfo.systemUptime
+                let count = Int(Self.visibleSeconds * UntypeWaveformBuffer.pointsPerSecond)
+                let seconds = Int(context.date.timeIntervalSince(controller.meetingStart ?? context.date))
+                HStack(spacing: 7) {
+                    pulsingDot(Self.meetingColor, at: now)
+                    cardText(Self.elapsed(max(0, seconds)), "Recording")
+                        .frame(width: 52, alignment: .leading)
+                    levelBars(controller.meetingTrace(count: count, at: now), color: Self.meetingColor)
+                        .frame(width: 76, height: 18)
+                }
+            }
+            roundButton("stop.fill", key: UntypeOverlayController.meetingKey, fill: Self.meetingColor, label: "Stop recording the meeting") {
+                controller.toggleMeeting()
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Recording a meeting")
+    }
+
+    /// Saved (or named): check, what was saved, Open and Name.
+    private func savedCard(_ headline: String) -> some View {
+        card {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Self.savedColor)
+            cardText(headline, controller.noticeDetail)
+                .frame(maxWidth: 128, alignment: .leading)
+            roundButton("doc.text", key: UntypeOverlayController.noticeKey, fill: Color.white.opacity(0.14), label: "Open the transcript") {
+                controller.performNoticeAction()
+            }
+            if controller.noticeRenameAction != nil {
+                roundButton("pencil", key: UntypeOverlayController.renameKey, fill: Color.white.opacity(0.14), label: "Name the meeting by voice") {
+                    controller.performRenameAction()
+                }
+            }
+        }
+    }
+
+    /// Listening to the meeting's name: pulsing blue dot, level bars, ✓ ✕.
+    private var namingView: some View {
+        card {
+            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { _ in
+                let now = ProcessInfo.processInfo.systemUptime
+                let count = Int(Self.visibleSeconds * UntypeWaveformBuffer.pointsPerSecond)
+                HStack(spacing: 7) {
+                    pulsingDot(Self.traceColor, at: now)
+                    cardText("Listening…", "Topic and people")
+                        .frame(width: 84, alignment: .leading)
+                    levelBars(controller.namingTrace(count: count, at: now), color: Self.traceColor, bars: 12)
+                        .frame(width: 48, height: 18)
+                }
+            }
+            roundButton("checkmark", key: UntypeOverlayController.namingDoneKey, fill: Self.savedColor.opacity(0.9), label: "Done") {
+                controller.finishNaming()
+            }
+            roundButton("xmark", key: UntypeOverlayController.namingCancelKey, fill: Color.white.opacity(0.14), label: "Cancel") {
+                controller.cancelNaming()
+            }
+        }
+    }
+
     /// The tray's dark rounded background; dragging it moves the overlay
     /// (`UntypeOverlayHostingView`).
     private var trayBackground: some View {
@@ -3542,7 +4055,7 @@ private struct UntypeOverlayView: View {
                 .font(.system(size: 9, weight: .semibold, design: .rounded))
                 .foregroundStyle(Color.white.opacity(0.6))
                 .padding(.trailing, 2)
-            ForEach(Self.translationChoices, id: \.policy) { choice in
+            ForEach(offeredTranslationChoices, id: \.policy) { choice in
                 let selected = controller.translationPolicy == choice.policy.rawValue
                 Button {
                     controller.setTranslationPolicy(choice.policy)
@@ -3563,6 +4076,25 @@ private struct UntypeOverlayView: View {
             }
             Spacer(minLength: 0)
             Button {
+                controller.toggleMeeting()
+            } label: {
+                let hovered = controller.hoveredChip == UntypeOverlayController.meetingKey
+                HStack(spacing: 3) {
+                    Image(systemName: isMeeting ? "stop.fill" : "circle.fill")
+                        .font(.system(size: 7, weight: .bold))
+                    Text(isMeeting ? "Stop" : "Record")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                }
+                .foregroundStyle(Color.white)
+                .padding(.horizontal, 8)
+                .frame(height: 17)
+                .background(Capsule(style: .continuous).fill(Self.meetingColor.opacity(hovered ? 1 : 0.85)))
+            }
+            .buttonStyle(.plain)
+            .contentShape(Rectangle())
+            .background(hitFrame(UntypeOverlayController.meetingKey))
+            .accessibilityLabel(isMeeting ? "Stop meeting recording" : "Record meeting")
+            Button {
                 controller.openSettings()
             } label: {
                 Image(systemName: "gearshape.fill")
@@ -3582,7 +4114,11 @@ private struct UntypeOverlayView: View {
 
     var body: some View {
         VStack(spacing: 6) {
-            if let notice = controller.notice {
+            if controller.overlayPhase == "naming" {
+                namingView
+            } else if let notice = controller.notice, controller.noticeAction != nil {
+                savedCard(notice)
+            } else if let notice = controller.notice {
                 Text(notice)
                     .font(.system(size: 11, weight: .semibold, design: .rounded))
                     .foregroundStyle(Color.white)
@@ -3595,18 +4131,21 @@ private struct UntypeOverlayView: View {
             } else if showsTray {
                 trayControls
                     .transition(.opacity)
+            } else if isIdle && isMeeting {
+                meetingCard
             } else if isIdle {
-                // Nothing is being recorded or processed: no trace, the
-                // chips keep their place.
-                Color.clear
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                // Nothing is being recorded or processed: no trace. The tray's
+                // row is laid out invisibly so the Record spot opens the tray.
+                trayControls
+                    .opacity(0)
+                    .allowsHitTesting(false)
                     .accessibilityHidden(true)
             } else {
                 TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { _ in
                     let count = Int(Self.visibleSeconds * UntypeWaveformBuffer.pointsPerSecond)
                     let trace = controller.oscilloscopeTrace(count: count, at: ProcessInfo.processInfo.systemUptime)
                     Canvas { canvas, size in
-                        drawTrace(trace, in: &canvas, size: size)
+                        drawTrace(trace, in: &canvas, size: size, color: Self.traceColor.opacity(isRecording ? 1 : 0.7))
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -3665,7 +4204,7 @@ private struct UntypeOverlayView: View {
                     .allowsHitTesting(false)
             }
         }
-        .animation(.easeOut(duration: 0.15), value: controller.pointerInside)
+        .animation(.easeOut(duration: 0.15), value: controller.trayOpen)
         .coordinateSpace(name: Self.coordinateSpace)
         .onPreferenceChange(UntypeOverlayChipFrames.self) { value in
             controller.chipFrames = value
@@ -3695,7 +4234,7 @@ private struct UntypeOverlayView: View {
 
     /// A thin line through every point; a faint shadow keeps it readable on
     /// both light and dark windows behind the transparent panel.
-    private func drawTrace(_ trace: [Float], in canvas: inout GraphicsContext, size: CGSize) {
+    private func drawTrace(_ trace: [Float], in canvas: inout GraphicsContext, size: CGSize, color: Color) {
         guard trace.count > 1 else {
             return
         }
@@ -3714,7 +4253,7 @@ private struct UntypeOverlayView: View {
         canvas.addFilter(.shadow(color: .black.opacity(0.35), radius: 1.5))
         canvas.stroke(
             path,
-            with: .color(Self.traceColor.opacity(isRecording ? 1 : 0.7)),
+            with: .color(color),
             style: StrokeStyle(lineWidth: 1.2, lineCap: .round, lineJoin: .round)
         )
     }

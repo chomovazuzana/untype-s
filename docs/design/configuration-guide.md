@@ -169,9 +169,27 @@ With **Refine** on, when you start dictating with the cursor inside a sentence, 
 
 ## Keep Overlay Visible
 
-**Keep overlay visible** (Settings → General → Dictation overlay, or menu-bar dropdown → Overlay → Keep on screen; `overlayAlwaysVisible` in `~/.tool-agents/untype/ui-state.json`, default **off**; no CLI flag or environment variable, like the theme) keeps the push-to-talk overlay at the bottom of the screen when you are not dictating. Idle, it shows a flat dim line and the operator chips, which you can click to switch an operator (hover for its name and state). Off: the overlay appears only while dictating or processing. An older `ui-state.json` without the key loads with it off. The setting also shapes the menu-bar dropdown: on, the dropdown only names the operators that are on, because the overlay has the switches; off, the dropdown has an **Operators** tab with the switches.
+**Keep overlay visible** (Settings → General → Dictation overlay, or menu-bar dropdown → Overlay → Keep on screen; `overlayAlwaysVisible` in `~/.tool-agents/untype/ui-state.json`, default **off**; no CLI flag or environment variable, like the theme) keeps the push-to-talk overlay at the bottom of the screen when you are not dictating. Idle, it shows only the operator chips, slightly dimmed, which you can click to switch an operator; hovering a chip brightens them, shows the chip's name and what it does, and opens the tray (translation target for each language chosen in Settings, ⏺ record meeting, Settings); the empty area above the chips does not react. Off: the overlay appears only while dictating or processing. An older `ui-state.json` without the key loads with it off. The setting also shapes the menu-bar dropdown: on, the dropdown only names the operators that are on, because the overlay has the switches; off, the dropdown has an **Operators** tab with the switches.
 
-**Overlay position** (build 45): drag the small grip in the overlay's top-left corner to move it anywhere; untype remembers the place as `overlayPosition` (`{"x":…, "y":…}`, the bottom-left corner in screen points) in `ui-state.json` and shows the overlay there from then on. Double-click the grip to put it back at the bottom centre (the key is removed). Without the key, or when the saved place is on a display that is no longer connected, the overlay appears at the bottom centre of the screen under the mouse.
+**Overlay position**: hover the overlay and drag its tray to move it anywhere; untype remembers the place as `overlayPosition` (`{"x":…, "y":…}`, the bottom-left corner in screen points) in `ui-state.json` and shows the overlay there from then on. Double-click the tray to put it back at the bottom centre (the key is removed). Without the key, or when the saved place is on a display that is no longer connected, the overlay appears at the bottom centre of the screen under the mouse.
+
+## Meeting Recording
+
+Records both sides of a call (your microphone and the sound of every other app, such as Teams or Zoom) into a transcript. Start and stop it from the overlay's tray (⏺ / ⏹) or the menu-bar dropdown (**Meeting → Record meeting**). It uses the same Soniox key and model as dictation (`SONIOX_API_KEY`, the speech provider must be Soniox) and the primary LLM for the English transcript; there are no extra keys and no environment variables. The settings are in Settings → General → Meeting recording and are stored as `meeting` in `~/.tool-agents/untype/ui-state.json`:
+
+| Setting | Key | Default | Options |
+|---|---|---|---|
+| Transcript language | `meeting.language` | `en` | `en`: `transcript.txt` in English (lines not in English are translated by the primary LLM at the end; lines already in English are kept). `original`: `transcript.txt` as spoken. |
+| Auto-stop after silence | `meeting.silenceMinutes` | `3` | Minutes without speech on either side that end the recording; `0` never stops by itself. |
+| Folder | `meeting.folder` | `~/Documents/untype Meetings` | Any folder; each meeting gets a subfolder named after its start (`2026-11-11 14.30`). |
+
+An older `ui-state.json` without `meeting` loads the defaults. An unknown `meeting.language` is an error when a recording starts.
+
+Each meeting folder holds `transcript.txt` (the chosen language, `[00:12:07] Speaker 2: …`), `transcript.original.txt` (as spoken, with the language per line, written live during the meeting) and `transcript.jsonl` (time, side, speaker, language, text, English). Your microphone is labelled **You**; the people on the call are **Speaker 1, 2, …** (Soniox speaker diarization). No audio is kept. When a recording ends, the overlay offers **Open transcript ›** and **✎ Name** for 10 seconds: click ✎ and say what the meeting was about and with whom; the primary LLM turns it into a short English title and the folder and main transcript are renamed to `2026-11-11 14.30 – Budget review with Maria.txt` (the other files keep their names).
+
+**Permissions**: Microphone, and **Screen & System Audio Recording** (System Settings → Privacy & Security), which macOS requires to capture other apps' sound (no picture is taken). untype asks for it the first time; after allowing it, start the recording again.
+
+**Headphones** are recommended: through speakers, the microphone also hears the other people, so their words can appear a second time as **You**.
 
 ## Voice Commands On/Off
 

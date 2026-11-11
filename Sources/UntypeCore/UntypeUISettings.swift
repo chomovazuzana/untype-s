@@ -77,6 +77,8 @@ public struct UntypeUISettings: Codable, Equatable, Sendable {
     /// Where the user dragged the overlay (nil: bottom centre of the screen
     /// under the mouse).
     public var overlayPosition: UntypeOverlayPosition? = nil
+    /// Meeting recording: transcript language, auto-stop, folder.
+    public var meeting: MeetingPreferences = MeetingPreferences()
 
     public static let `default` = UntypeUISettings(
         provider: "soniox",
@@ -324,6 +326,9 @@ public struct UntypeUISettings: Codable, Equatable, Sendable {
         if let overlayAlwaysVisible = patch.overlayAlwaysVisible {
             next.overlayAlwaysVisible = overlayAlwaysVisible
         }
+        if let meeting = patch.meeting {
+            next.meeting = meeting
+        }
         return try next.normalized()
     }
 
@@ -445,6 +450,7 @@ public struct UntypeUISettingsPatch: Sendable, Equatable {
     public var overlayPosition: UntypeOverlayPosition?
     /// true: forget `overlayPosition` (back to the default place).
     public var resetOverlayPosition: Bool?
+    public var meeting: MeetingPreferences?
 
     public init(
         provider: String? = nil,
@@ -491,7 +497,8 @@ public struct UntypeUISettingsPatch: Sendable, Equatable {
         overlayAlwaysVisible: Bool? = nil,
         pushToAct: PushToActPreferences? = nil,
         overlayPosition: UntypeOverlayPosition? = nil,
-        resetOverlayPosition: Bool? = nil
+        resetOverlayPosition: Bool? = nil,
+        meeting: MeetingPreferences? = nil
     ) {
         self.provider = provider
         self.model = model
@@ -538,6 +545,7 @@ public struct UntypeUISettingsPatch: Sendable, Equatable {
         self.pushToAct = pushToAct
         self.overlayPosition = overlayPosition
         self.resetOverlayPosition = resetOverlayPosition
+        self.meeting = meeting
     }
 }
 
@@ -807,7 +815,8 @@ public enum UntypeUISettingsStore {
             appearance: current.appearance,
             overlayAlwaysVisible: current.overlayAlwaysVisible,
             pushToAct: current.pushToAct,
-            overlayPosition: current.overlayPosition
+            overlayPosition: current.overlayPosition,
+            meeting: current.meeting
         )
         return try settings.normalized().refreshingCredentialStatus(
             cwd: cwd,
@@ -882,6 +891,7 @@ private struct PersistedUISettings: Codable {
     let overlayAlwaysVisible: Bool?
     let pushToAct: PushToActPreferences?
     let overlayPosition: UntypeOverlayPosition?
+    let meeting: MeetingPreferences?
 
     enum CodingKeys: String, CodingKey {
         case provider
@@ -928,6 +938,7 @@ private struct PersistedUISettings: Codable {
         case overlayAlwaysVisible
         case pushToAct
         case overlayPosition
+        case meeting
     }
 
     init(settings: UntypeUISettings) {
@@ -975,6 +986,7 @@ private struct PersistedUISettings: Codable {
         self.overlayAlwaysVisible = settings.overlayAlwaysVisible
         self.pushToAct = settings.pushToAct
         self.overlayPosition = settings.overlayPosition
+        self.meeting = settings.meeting
     }
 
     func toRuntimeSettings(path: String) throws -> UntypeUISettings {
@@ -1024,7 +1036,8 @@ private struct PersistedUISettings: Codable {
                 appearance: appearance ?? defaults.appearance,
                 overlayAlwaysVisible: overlayAlwaysVisible ?? defaults.overlayAlwaysVisible,
                 pushToAct: pushToAct,
-                overlayPosition: overlayPosition
+                overlayPosition: overlayPosition,
+                meeting: meeting ?? MeetingPreferences()
             ))
         } catch {
             throw UntypeError.invalidConfiguration("Invalid UI settings state at \(path): \(error.localizedDescription). Delete or fix \(path).")
@@ -1332,4 +1345,44 @@ private func settingsDiagnosticLine(_ error: Error) -> String {
 
 private func iso8601Now() -> String {
     ISO8601DateFormatter().string(from: Date())
+}
+
+/// Meeting recording settings (Settings → General → Meeting recording).
+public struct MeetingPreferences: Codable, Equatable, Sendable {
+    public static let defaultSilenceMinutes = 3
+
+    /// `MeetingTranscriptLanguage` raw value.
+    public var language: String
+    /// Auto-stop after this many minutes without speech (0: never).
+    public var silenceMinutes: Int
+    /// Folder of the meeting folders (nil: `~/Documents/untype Meetings`).
+    public var folder: String?
+
+    public init(language: String = MeetingTranscriptLanguage.english.rawValue, silenceMinutes: Int = Self.defaultSilenceMinutes, folder: String? = nil) {
+        self.language = language
+        self.silenceMinutes = silenceMinutes
+        self.folder = folder
+    }
+
+    public var transcriptLanguage: MeetingTranscriptLanguage {
+        get throws {
+            guard let value = MeetingTranscriptLanguage(rawValue: language) else {
+                throw UntypeError.invalidConfiguration("Unknown meeting transcript language '\(language)'. Use 'en' or 'original'.")
+            }
+            return value
+        }
+    }
+
+    public static var defaultFolder: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Documents", isDirectory: true)
+            .appendingPathComponent("untype Meetings", isDirectory: true)
+    }
+
+    public var folderURL: URL {
+        guard let folder, !folder.isEmpty else {
+            return Self.defaultFolder
+        }
+        return URL(fileURLWithPath: (folder as NSString).expandingTildeInPath, isDirectory: true)
+    }
 }

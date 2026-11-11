@@ -204,6 +204,27 @@ struct UntypeMenuBarPanel: View {
             }
             .help("Keep the dictation overlay on screen when you are not dictating. Also in Settings → General.")
 
+            HStack(spacing: 8) {
+                rowLabel("Meeting")
+                Button {
+                    model.toggleMeetingRecording()
+                } label: {
+                    Label(
+                        model.meetingRecording ? "Stop recording" : "Record meeting",
+                        systemImage: model.meetingRecording ? "stop.circle.fill" : "record.circle"
+                    )
+                }
+                .controlSize(.small)
+                .tint(.red)
+                .disabled(model.meetingBusy)
+                Spacer(minLength: 6)
+                Button("Open folder") {
+                    model.openMeetingsFolder()
+                }
+                .controlSize(.small)
+            }
+            .help("Record both sides of a call into a transcript. Also from the overlay's tray (⏺).")
+
             if !showsOperatorsTab {
                 operatorsSummary
             }
@@ -300,7 +321,6 @@ struct UntypeMenuBarPanel: View {
 
     private var translationTargetRow: some View {
         Picker("Translate to", selection: binding(\.translationPolicy) { UntypeUISettingsPatch(translationPolicy: $0) }) {
-            Text("Opposite language").tag("opposite")
             Text("English").tag("to-en")
             Text("Greek").tag("to-el")
         }
