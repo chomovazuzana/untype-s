@@ -382,7 +382,7 @@ final class UntypeUIModel: ObservableObject {
     /// the reminder's Record), and when the recording started.
     private var recordingCalendarMeeting: CalendarMeeting?
     private var recordingStartedAt: Date?
-    private static let calendarRefreshInterval: TimeInterval = 2 * 60
+    private static let calendarRefreshInterval: TimeInterval = 5 * 60
 
     /// Microphone samples of the current push-to-talk turn, for the overlay trace.
     var microphoneWaveform: UntypeWaveformBuffer? {

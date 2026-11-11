@@ -20,7 +20,7 @@ untype knows the user's meetings (the Outlook calendar, read through the `nbg-m3
 
 ## Build order
 1. Pure rules and the CLI runner (`MeetingCalendar.swift`), unit tests, a live test against the real calendar (`UNTYPE_LIVE_CALENDAR_TEST=1`).
-2. Model: calendar watch (15 s tick, refresh every 2 min), reminder queue, naming at stop.
+2. Model: calendar watch (15 s tick, refresh every 5 min), reminder queue, naming at stop.
 3. Overlay reminder card; Settings switch.
 4. Docs: functions (FR-61), design, configuration guide, issues.
 
