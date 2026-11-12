@@ -60,6 +60,21 @@ One hotkey serves both ways of dictating:
 
 Every way runs the same pipeline after the recording ends: refinement, translation, clipboard, and focused-input delivery according to the operator toggles. Return is pressed only when the text was delivered to the app the turn started in; with focused-input delivery off, Enter only ends the turn. Enter and Esc with a modifier pass through to the app. The 0.4 s threshold is fixed (`HotkeyTapOrHold.tapThreshold`). A `hotkeyHoldToTalk` key in an older `ui-state.json` is ignored.
 
+### Two-key chord through Hammerspoon (optional)
+
+`integrations/hammerspoon/untype-ptt.lua` lets two ordinary keys pressed together act as the hotkey, so no dedicated key is needed. With it, the keys beside Enter (`'` and `\` on the ABC layout, matched by physical position, so any input layout works) drive untype; either key alone still types normally.
+
+- **How it works:** while both keys are down, the module holds F16 down for the untype process; when they come up, it releases F16. untype tells a tap from a hold and catches Enter and Esc, so a tap of the chord starts a hands-free turn and a second tap finishes it (type only). F16 is posted straight to untype, because posted the ordinary way it would reach only the app in front.
+- **Requirements:** [Hammerspoon](https://www.hammerspoon.org) with Accessibility granted, and untype's hotkey set to plain `F16`.
+- **Install:** link the module into Hammerspoon's folder and load it from `~/.hammerspoon/init.lua`, then reload Hammerspoon:
+  ```sh
+  ln -s "$PWD/integrations/hammerspoon/untype-ptt.lua" ~/.hammerspoon/untype-ptt.lua
+  echo 'require("untype-ptt")' >> ~/.hammerspoon/init.lua
+  ```
+  The link keeps one copy, so a change to the module in the repository takes effect on the next Hammerspoon reload.
+- **Settings in the module:** `QUOTE_KEY` / `BACKSLASH_KEY` (the two key codes), `CHORD_SECONDS` (0.07: the second key must follow the first within this time to count as a chord), `KEY` / `KEY_CODE` (the hotkey sent to untype, `f16` / 106), `BUNDLE_ID` (`com.local.untype`).
+- **Must stay in step with untype:** the module passes press and release through unchanged and keeps no tap logic of its own. A module that holds F16 down after a tap hides the release from untype, and then a tap never starts a hands-free turn.
+
 ## Claude as the LLM Provider (`anthropic`, `azure-anthropic`)
 
 ### Purpose
