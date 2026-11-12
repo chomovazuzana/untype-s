@@ -386,14 +386,8 @@ struct UntypeSettingsView: View {
                 }
             }
             .disabled(sessionShapingDisabled)
-            Picker("Recording", selection: binding(\.hotkeyHoldToTalk)) {
-                Text("Hold to talk").tag(true)
-                Text("Press to start and stop").tag(false)
-            }
         } footer: {
-            caption(model.settings.hotkeyHoldToTalk
-                ? "Push-to-talk: hold the hotkey to record, release to submit."
-                : "Push-to-listen: press the hotkey to start, press again to stop and submit.")
+            caption("Hold the hotkey to record and release to submit. Tap it to keep recording hands-free, then press Enter to type the text and send it, the hotkey to type it only, or Esc to discard.")
         }
 
         Section {
@@ -805,8 +799,6 @@ struct UntypeSettingsView: View {
             return UntypeUISettingsPatch(voiceCommands: value as? Bool)
         case \UntypeUISettings.hotkeyEnabled:
             return UntypeUISettingsPatch(hotkeyEnabled: value as? Bool)
-        case \UntypeUISettings.hotkeyHoldToTalk:
-            return UntypeUISettingsPatch(hotkeyHoldToTalk: value as? Bool)
         case \UntypeUISettings.hotkey:
             return UntypeUISettingsPatch(hotkey: value as? String)
         case \UntypeUISettings.selectionHotkeyEnabled:

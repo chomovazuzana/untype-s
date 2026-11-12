@@ -139,18 +139,6 @@ struct UntypeMenuBarPanel: View {
             .help(model.canReshapeSession ? "Listen for the global hotkey" : "Locked while a turn or a manual session is running")
 
             HStack(spacing: 8) {
-                rowLabel("Trigger")
-                Picker("Hotkey mode", selection: binding(\.hotkeyHoldToTalk) { UntypeUISettingsPatch(hotkeyHoldToTalk: $0) }) {
-                    Text("Push-to-talk").tag(true)
-                    Text("Push-to-listen").tag(false)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .help("Push-to-talk: hold the hotkey to record, release to submit. Push-to-listen: press once to start, press again to stop and submit.")
-
-            HStack(spacing: 8) {
                 rowLabel("Mode")
                 Picker("Protocol mode", selection: binding(\.protocolMode) { UntypeUISettingsPatch(protocolMode: $0) }) {
                     Text("Dictation").tag("dictation")
@@ -240,9 +228,7 @@ struct UntypeMenuBarPanel: View {
         guard model.settings.hotkeyEnabled else {
             return "The hotkey is off — switch it on to dictate."
         }
-        return model.settings.hotkeyHoldToTalk
-            ? "Hold the hotkey to record, release to submit."
-            : "Press the hotkey to start, press it again to submit."
+        return "Hold the hotkey and release to submit, or tap it and finish with Enter (send) or the hotkey (type only)."
     }
 
     private func rowLabel(_ title: String) -> some View {

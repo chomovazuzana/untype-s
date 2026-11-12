@@ -51,10 +51,6 @@ public struct UntypeUISettings: Codable, Equatable, Sendable {
     public var microphoneStatus: String
     public var accessibilityStatus: String
     public var hotkeyEnabled: Bool
-    /// `true`: push-to-talk (hold the hotkey to record, release to submit).
-    /// `false`: push-to-listen (press once to start recording, press again to
-    /// stop and submit). Requires `hotkeyEnabled` either way.
-    public var hotkeyHoldToTalk: Bool
     public var hotkey: String
     /// Selection hotkey: processes the text selected in the active app with
     /// the active refine/translate/Ask operators and replaces it (no
@@ -79,6 +75,21 @@ public struct UntypeUISettings: Codable, Equatable, Sendable {
     public var overlayPosition: UntypeOverlayPosition? = nil
     /// Meeting recording: transcript language, auto-stop, folder.
     public var meeting: MeetingPreferences = MeetingPreferences()
+    /// Operator chips (letters, e.g. "R", "I") the idle overlay shows at
+    /// rest; empty: all of them.
+    public var pinnedOperators: [String] = []
+
+    /// The overlay's operator letters, in chip order.
+    public static let operatorLetters = ["R", "T", "A", "F", "S", "L", "W", "C", "I"]
+
+    /// Known letters only, upper case, in chip order, once each.
+    static func normalizePinnedOperators(_ letters: [String]) throws -> [String] {
+        let wanted = Set(letters.map { $0.uppercased() })
+        if let unknown = wanted.subtracting(operatorLetters).sorted().first {
+            throw UntypeError.invalidConfiguration("Unknown operator in pinnedOperators: \(unknown). Use \(operatorLetters.joined(separator: ", ")).")
+        }
+        return operatorLetters.filter(wanted.contains)
+    }
 
     public static let `default` = UntypeUISettings(
         provider: "soniox",
@@ -117,7 +128,6 @@ public struct UntypeUISettings: Codable, Equatable, Sendable {
         microphoneStatus: "unknown",
         accessibilityStatus: "unknown",
         hotkeyEnabled: false,
-        hotkeyHoldToTalk: true,
         hotkey: "Control+`",
         selectionHotkeyEnabled: true,
         selectionHotkey: UntypeUISettings.defaultSelectionHotkey,
@@ -174,6 +184,7 @@ public struct UntypeUISettings: Codable, Equatable, Sendable {
         next.appearance = try normalizeAppearance(appearance)
         next.selectionRole = try normalizeSelectionRole(selectionRole)
         next.perTurnOperators = try normalizePerTurnOperators(perTurnOperators)
+        next.pinnedOperators = try Self.normalizePinnedOperators(pinnedOperators)
         let altProvider = altLlmProvider.trimmingCharacters(in: .whitespacesAndNewlines)
         next.altLlmProvider = altProvider.isEmpty ? "" : try normalizeLLMProvider(altProvider)
         next.altLlmModel = altLlmModel.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -287,9 +298,6 @@ public struct UntypeUISettings: Codable, Equatable, Sendable {
         if let hotkeyEnabled = patch.hotkeyEnabled {
             next.hotkeyEnabled = hotkeyEnabled
         }
-        if let hotkeyHoldToTalk = patch.hotkeyHoldToTalk {
-            next.hotkeyHoldToTalk = hotkeyHoldToTalk
-        }
         if let hotkey = patch.hotkey {
             next.hotkey = hotkey
         }
@@ -328,6 +336,9 @@ public struct UntypeUISettings: Codable, Equatable, Sendable {
         }
         if let meeting = patch.meeting {
             next.meeting = meeting
+        }
+        if let pinnedOperators = patch.pinnedOperators {
+            next.pinnedOperators = pinnedOperators
         }
         return try next.normalized()
     }
@@ -433,7 +444,6 @@ public struct UntypeUISettingsPatch: Sendable, Equatable {
     public var alt2LlmProvider: String?
     public var alt2LlmModel: String?
     public var hotkeyEnabled: Bool?
-    public var hotkeyHoldToTalk: Bool?
     public var hotkey: String?
     public var selectionHotkeyEnabled: Bool?
     public var selectionHotkey: String?
@@ -451,6 +461,7 @@ public struct UntypeUISettingsPatch: Sendable, Equatable {
     /// true: forget `overlayPosition` (back to the default place).
     public var resetOverlayPosition: Bool?
     public var meeting: MeetingPreferences?
+    public var pinnedOperators: [String]?
 
     public init(
         provider: String? = nil,
@@ -482,7 +493,6 @@ public struct UntypeUISettingsPatch: Sendable, Equatable {
         alt2LlmProvider: String? = nil,
         alt2LlmModel: String? = nil,
         hotkeyEnabled: Bool? = nil,
-        hotkeyHoldToTalk: Bool? = nil,
         hotkey: String? = nil,
         selectionHotkeyEnabled: Bool? = nil,
         selectionHotkey: String? = nil,
@@ -498,7 +508,8 @@ public struct UntypeUISettingsPatch: Sendable, Equatable {
         pushToAct: PushToActPreferences? = nil,
         overlayPosition: UntypeOverlayPosition? = nil,
         resetOverlayPosition: Bool? = nil,
-        meeting: MeetingPreferences? = nil
+        meeting: MeetingPreferences? = nil,
+        pinnedOperators: [String]? = nil
     ) {
         self.provider = provider
         self.model = model
@@ -529,7 +540,6 @@ public struct UntypeUISettingsPatch: Sendable, Equatable {
         self.alt2LlmProvider = alt2LlmProvider
         self.alt2LlmModel = alt2LlmModel
         self.hotkeyEnabled = hotkeyEnabled
-        self.hotkeyHoldToTalk = hotkeyHoldToTalk
         self.hotkey = hotkey
         self.selectionHotkeyEnabled = selectionHotkeyEnabled
         self.selectionHotkey = selectionHotkey
@@ -546,6 +556,7 @@ public struct UntypeUISettingsPatch: Sendable, Equatable {
         self.overlayPosition = overlayPosition
         self.resetOverlayPosition = resetOverlayPosition
         self.meeting = meeting
+        self.pinnedOperators = pinnedOperators
     }
 }
 
@@ -801,7 +812,6 @@ public enum UntypeUISettingsStore {
             microphoneStatus: current.microphoneStatus,
             accessibilityStatus: current.accessibilityStatus,
             hotkeyEnabled: current.hotkeyEnabled,
-            hotkeyHoldToTalk: current.hotkeyHoldToTalk,
             hotkey: current.hotkey,
             selectionHotkeyEnabled: current.selectionHotkeyEnabled,
             selectionHotkey: current.selectionHotkey,
@@ -816,7 +826,8 @@ public enum UntypeUISettingsStore {
             overlayAlwaysVisible: current.overlayAlwaysVisible,
             pushToAct: current.pushToAct,
             overlayPosition: current.overlayPosition,
-            meeting: current.meeting
+            meeting: current.meeting,
+            pinnedOperators: current.pinnedOperators
         )
         return try settings.normalized().refreshingCredentialStatus(
             cwd: cwd,
@@ -876,7 +887,6 @@ private struct PersistedUISettings: Codable {
     let alt2LlmProvider: String?
     let alt2LlmModel: String?
     let hotkeyEnabled: Bool
-    let hotkeyHoldToTalk: Bool?
     let hotkey: String
     let selectionHotkeyEnabled: Bool?
     let selectionHotkey: String?
@@ -892,6 +902,7 @@ private struct PersistedUISettings: Codable {
     let pushToAct: PushToActPreferences?
     let overlayPosition: UntypeOverlayPosition?
     let meeting: MeetingPreferences?
+    let pinnedOperators: [String]?
 
     enum CodingKeys: String, CodingKey {
         case provider
@@ -923,7 +934,6 @@ private struct PersistedUISettings: Codable {
         case alt2LlmProvider
         case alt2LlmModel
         case hotkeyEnabled
-        case hotkeyHoldToTalk
         case hotkey
         case selectionHotkeyEnabled
         case selectionHotkey
@@ -939,6 +949,7 @@ private struct PersistedUISettings: Codable {
         case pushToAct
         case overlayPosition
         case meeting
+        case pinnedOperators
     }
 
     init(settings: UntypeUISettings) {
@@ -971,7 +982,6 @@ private struct PersistedUISettings: Codable {
         self.alt2LlmProvider = settings.alt2LlmProvider
         self.alt2LlmModel = settings.alt2LlmModel
         self.hotkeyEnabled = settings.hotkeyEnabled
-        self.hotkeyHoldToTalk = settings.hotkeyHoldToTalk
         self.hotkey = settings.hotkey
         self.selectionHotkeyEnabled = settings.selectionHotkeyEnabled
         self.selectionHotkey = settings.selectionHotkey
@@ -987,6 +997,7 @@ private struct PersistedUISettings: Codable {
         self.pushToAct = settings.pushToAct
         self.overlayPosition = settings.overlayPosition
         self.meeting = settings.meeting
+        self.pinnedOperators = settings.pinnedOperators
     }
 
     func toRuntimeSettings(path: String) throws -> UntypeUISettings {
@@ -1022,7 +1033,6 @@ private struct PersistedUISettings: Codable {
                 alt2LlmProvider: alt2LlmProvider ?? defaults.alt2LlmProvider,
                 alt2LlmModel: alt2LlmModel ?? defaults.alt2LlmModel,
                 hotkeyEnabled: hotkeyEnabled,
-                hotkeyHoldToTalk: hotkeyHoldToTalk ?? defaults.hotkeyHoldToTalk,
                 hotkey: hotkey,
                 selectionHotkeyEnabled: selectionHotkeyEnabled ?? defaults.selectionHotkeyEnabled,
                 selectionHotkey: selectionHotkey ?? defaults.selectionHotkey,
@@ -1037,7 +1047,8 @@ private struct PersistedUISettings: Codable {
                 overlayAlwaysVisible: overlayAlwaysVisible ?? defaults.overlayAlwaysVisible,
                 pushToAct: pushToAct,
                 overlayPosition: overlayPosition,
-                meeting: meeting ?? MeetingPreferences()
+                meeting: meeting ?? MeetingPreferences(),
+                pinnedOperators: pinnedOperators ?? []
             ))
         } catch {
             throw UntypeError.invalidConfiguration("Invalid UI settings state at \(path): \(error.localizedDescription). Delete or fix \(path).")

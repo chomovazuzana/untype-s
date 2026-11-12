@@ -397,6 +397,19 @@ final class UntypeUIModel: ObservableObject {
     /// A press that arrived while `runtimeStopInFlight`: it starts its turn
     /// as soon as the previous one is delivered, instead of being lost.
     private var hotkeyPressQueued = false
+    /// When the hotkey went down (system uptime), to tell a tap from a hold.
+    private var hotkeyPressedAt: TimeInterval?
+    /// A tap started this turn: it records hands-free until Enter (type and
+    /// send), the hotkey again (type only) or Esc (discard).
+    @Published private(set) var hotkeyHandsFree = false
+    /// The turn was finished with Enter: Return is pressed in the field once
+    /// its text is delivered.
+    private var sendAfterDelivery = false
+    private lazy var handsFreeKeys = UntypeReturnEscapeKeyTap { [weak self] confirm in
+        dispatchToUI { [weak self] in
+            self?.finishHandsFreeTurn(confirm ? .typeAndSend : .discard, source: confirm ? "enter" : "esc")
+        }
+    }
     /// A Push-to-Act run is reading the selection, showing its pop-up or processing.
     private var selectionHotkeyInFlight = false
     private var lastAudioEventCategory: String?
@@ -729,8 +742,19 @@ final class UntypeUIModel: ObservableObject {
         return NSWorkspace.shared.frontmostApplication?.processIdentifier == origin.processIdentifier
     }
 
-    /// After delivery: the app the user had moved to gets the focus back.
-    func finishFocusedInputDelivery() {
+    /// After delivery: a turn finished with Enter gets Return pressed in the
+    /// field (sending the message), then the app the user had moved to gets
+    /// the focus back.
+    func finishFocusedInputDelivery(delivered: Bool) {
+        if sendAfterDelivery {
+            sendAfterDelivery = false
+            if delivered, focusedInputOriginIsFrontmost {
+                LiveKeyboardPoster.postReturn()
+                appendEvent("diagnostic.info: [untype] Return pressed after delivery (turn finished with Enter)")
+            } else {
+                appendEvent("diagnostic.warning: [untype] Return not pressed: the text was not delivered to the app the dictation started in")
+            }
+        }
         guard let application = focusedInputReturnApplication else {
             return
         }
@@ -796,6 +820,24 @@ final class UntypeUIModel: ObservableObject {
             if overlayAlwaysVisible != nil {
                 overlay?.applyAlwaysVisible()
             }
+        } catch {
+            appendEvent("diagnostic.warning: \(error.localizedDescription)")
+        }
+    }
+
+    /// The pin on an overlay chip: pinned chips are the ones the idle
+    /// overlay shows at rest.
+    func togglePinnedOperator(_ letter: String) {
+        var pinned = settings.pinnedOperators
+        if let index = pinned.firstIndex(of: letter) {
+            pinned.remove(at: index)
+        } else {
+            pinned.append(letter)
+        }
+        do {
+            settings = try settings.merged(UntypeUISettingsPatch(pinnedOperators: pinned))
+            try UntypeUISettingsStore.save(settings)
+            overlay?.refreshOperators()
         } catch {
             appendEvent("diagnostic.warning: \(error.localizedDescription)")
         }
@@ -912,24 +954,100 @@ final class UntypeUIModel: ObservableObject {
         return "Stop Listening"
     }
 
-    /// Hotkey pressed. Push-to-talk (hold) mode starts recording; the release
-    /// event stops it. Push-to-listen (toggle) mode starts recording on the
-    /// first press and stops it on the next press; releases are ignored.
+    /// Hotkey pressed: recording starts at once. In a hands-free turn the
+    /// press finishes it instead (the text is typed only).
     func handleHotkeyPress(source: String = "hotkey") {
         cancelPushToActPanel()
-        if !settings.hotkeyHoldToTalk, hotkeyPressed {
-            stopHotkeySession(source: source)
+        if hotkeyHandsFree {
+            finishHandsFreeTurn(.typeOnly, source: source)
             return
         }
+        hotkeyPressedAt = ProcessInfo.processInfo.systemUptime
         startHotkeySession(source: source)
     }
 
-    /// Hotkey released. Only push-to-talk (hold) mode reacts.
+    /// Hotkey released. After a hold the turn is submitted (push-to-talk);
+    /// after a tap it keeps recording hands-free.
     func handleHotkeyRelease(source: String = "hotkey") {
-        guard settings.hotkeyHoldToTalk else {
+        guard !hotkeyHandsFree else {
+            return
+        }
+        let pressedAt = hotkeyPressedAt
+        hotkeyPressedAt = nil
+        if hotkeyPressed, let pressedAt,
+           HotkeyTapOrHold.isTap(heldFor: ProcessInfo.processInfo.systemUptime - pressedAt) {
+            beginHandsFreeTurn(source: source)
             return
         }
         stopHotkeySession(source: source)
+    }
+
+    /// A tap: the turn goes on recording; Enter, Esc and the hotkey end it.
+    private func beginHandsFreeTurn(source: String) {
+        hotkeyHandsFree = true
+        let keysCaught = handsFreeKeys.start()
+        overlay?.setHandsFreeHint(keysCaught
+            ? "Enter send · tap again type · Esc cancel"
+            : "Tap again to finish")
+        appendEvent("diagnostic.info: [untype] push-to-talk tapped: recording hands-free until Enter (type and send), \(settings.hotkey) (type only) or Esc (discard) (\(source))")
+        if !keysCaught {
+            appendEvent("diagnostic.warning: [untype] Enter and Esc cannot be caught (macOS did not allow the key tap); press \(settings.hotkey) to finish the turn")
+        }
+    }
+
+    /// Ends a hands-free turn the way the user chose.
+    func finishHandsFreeTurn(_ finish: HotkeyTurnFinish, source: String) {
+        guard hotkeyHandsFree else {
+            return
+        }
+        endHandsFree()
+        appendEvent("diagnostic.info: [untype] hands-free turn finished: \(finish.rawValue) (\(source))")
+        switch finish {
+        case .typeOnly:
+            stopHotkeySession(source: source)
+        case .typeAndSend:
+            sendAfterDelivery = settings.focusedInput
+            stopHotkeySession(source: source)
+        case .discard:
+            discardHotkeySession(source: source)
+        }
+    }
+
+    private func endHandsFree() {
+        guard hotkeyHandsFree else {
+            return
+        }
+        hotkeyHandsFree = false
+        handsFreeKeys.stop()
+        overlay?.setHandsFreeHint(nil)
+    }
+
+    /// Esc in a hands-free turn: nothing is submitted, and the text typed
+    /// live into the field is removed.
+    private func discardHotkeySession(source: String) {
+        if hotkeyPressQueued {
+            hotkeyPressQueued = false
+            hotkeyPressed = false
+            appendEvent("diagnostic.info: [untype] push-to-talk discarded before it started (\(source))")
+            return
+        }
+        guard hotkeyPressed else {
+            return
+        }
+        hotkeyPressed = false
+        captureState = "finalizing"
+        hotkeySessionControl?.close()
+        if let typer = liveTyper {
+            liveTyper = nil
+            typer.hold()
+            Task { @MainActor in
+                _ = await typer.reconcile(with: "")
+            }
+        }
+        appendEvent("diagnostic.info: [untype] push-to-talk discarded (\(source))")
+        restartWarmSessionAfterStop = settings.hotkeyEnabled
+        stopSession(reason: "ui-hotkey-discard", submitPending: false)
+        overlay?.showNotice("Discarded", seconds: 1)
     }
 
     /// Push-to-Act (selection hotkey) pressed: the text selected in the app
@@ -1210,13 +1328,9 @@ final class UntypeUIModel: ObservableObject {
         }
     }
 
-    var hotkeyModeLabel: String {
-        settings.hotkeyHoldToTalk ? "push-to-talk" : "push-to-listen"
-    }
-
     func startHotkeySession(source: String = "hotkey") {
         guard settings.hotkeyEnabled else {
-            appendEvent("diagnostic.warning: [untype] \(hotkeyModeLabel) ignored because the hotkey is disabled")
+            appendEvent("diagnostic.warning: [untype] push-to-talk ignored because the hotkey is disabled")
             return
         }
         guard sessionOwner != .manual else {
@@ -1230,10 +1344,11 @@ final class UntypeUIModel: ObservableObject {
             hotkeyPressQueued = true
             hotkeyPressed = true
             clearWarmSessionRecycleTimer()
-            appendEvent("diagnostic.info: [untype] \(hotkeyModeLabel) queued until the previous turn is delivered (\(source))")
+            appendEvent("diagnostic.info: [untype] push-to-talk queued until the previous turn is delivered (\(source))")
             return
         }
         hotkeyPressed = true
+        sendAfterDelivery = false
         captureState = "recording"
         latestTranscript = ""
         timeline.clearPartial()
@@ -1253,7 +1368,7 @@ final class UntypeUIModel: ObservableObject {
         if runtime != nil, sessionOwner == .hotkey, sessionState == TranscriptionSessionState.stopped.rawValue {
             // The runtime ended on its own before its stop event was handled;
             // never record into it.
-            appendEvent("diagnostic.warning: [untype] \(hotkeyModeLabel) found a stopped session; starting a new one")
+            appendEvent("diagnostic.warning: [untype] push-to-talk found a stopped session; starting a new one")
             runtime = nil
             sessionOwner = nil
         }
@@ -1261,14 +1376,14 @@ final class UntypeUIModel: ObservableObject {
             clearWarmSessionRewarmTimer()
             startSession(owner: .hotkey, audioGate: control)
         }
-        appendEvent("diagnostic.info: [untype] \(hotkeyModeLabel) started (\(source))")
+        appendEvent("diagnostic.info: [untype] push-to-talk started (\(source))")
     }
 
     func stopHotkeySession(source: String = "hotkey") {
         if hotkeyPressQueued {
             hotkeyPressQueued = false
             hotkeyPressed = false
-            appendEvent("diagnostic.warning: [untype] \(hotkeyModeLabel) released before the previous turn was delivered; nothing was recorded (\(source))")
+            appendEvent("diagnostic.warning: [untype] push-to-talk released before the previous turn was delivered; nothing was recorded (\(source))")
             return
         }
         guard hotkeyPressed else {
@@ -1278,7 +1393,7 @@ final class UntypeUIModel: ObservableObject {
         hotkeyPressed = false
         captureState = "finalizing"
         hotkeySessionControl?.close()
-        appendEvent("diagnostic.info: [untype] \(hotkeyModeLabel) stopped (\(source))")
+        appendEvent("diagnostic.info: [untype] push-to-talk stopped (\(source))")
         restartWarmSessionAfterStop = settings.hotkeyEnabled
         stopSession(reason: "ui-hotkey-release", submitPending: true, releaseMarker: releaseMarker)
         // The processing wave stays until the turn is delivered (the stop
@@ -1511,11 +1626,12 @@ final class UntypeUIModel: ObservableObject {
                         }
                         try? await Task.sleep(nanoseconds: 100_000_000)
                     },
-                    focusedInputCompletion: {
-                        // Let the last keystrokes land before the focus moves.
+                    focusedInputCompletion: { delivered in
+                        // Let the last keystrokes land before Return is
+                        // pressed or the focus moves.
                         try? await Task.sleep(nanoseconds: 150_000_000)
                         await MainActor.run {
-                            modelBox.model?.finishFocusedInputDelivery()
+                            modelBox.model?.finishFocusedInputDelivery(delivered: delivered)
                         }
                     },
                     focusedInputReconciliation: { @MainActor text in
@@ -1611,7 +1727,11 @@ final class UntypeUIModel: ObservableObject {
                 self.isRunning = false
                 self.hotkeyPressed = false
                 self.runtimeStopInFlight = false
-                if reason == "ui-hotkey-release" {
+                self.sendAfterDelivery = false
+                if self.sessionOwner == nil, !self.hotkeyPressQueued {
+                    self.endHandsFree()
+                }
+                if reason == "ui-hotkey-release" || reason == "ui-hotkey-discard" {
                     self.resetPerTurnOperators()
                 }
                 if self.hotkeyPressQueued {
@@ -1638,6 +1758,7 @@ final class UntypeUIModel: ObservableObject {
         hotkeySessionControl = nil
         sessionFocusedInputApplication = nil
         hotkeyPressed = false
+        endHandsFree()
         sessionState = "idle"
         captureState = "idle"
         audioStatus = "idle"
@@ -2529,26 +2650,6 @@ private struct UntypeRootView: View {
             }
             .keyboardShortcut("r", modifiers: [.command])
 
-            HStack(spacing: 6) {
-                Image(systemName: model.settings.hotkeyHoldToTalk ? "hand.tap.fill" : "mic.fill")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(UntypeDesignTokens.accentAmber)
-                Text(model.settings.hotkeyHoldToTalk ? "Push-to-talk" : "Push-to-listen")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(Color.primary)
-                Toggle("Push-to-talk", isOn: pushToTalkBinding)
-                    .toggleStyle(.switch)
-                    .labelsHidden()
-                    .tint(UntypeDesignTokens.accentAmber)
-            }
-            .padding(.leading, 2)
-            .help(model.settings.hotkeyHoldToTalk
-                  ? "Push-to-talk: hold \(model.settings.hotkey) to record, release to submit. Switch off for push-to-listen: press once to start, press again to stop and submit."
-                  : "Push-to-listen: press \(model.settings.hotkey) once to start recording, press it again to stop and submit. Switch on for push-to-talk (hold to record).")
-            .accessibilityLabel("Push-to-talk mode")
-
-            Divider().frame(height: 16)
-
             Button {
                 model.refreshCredentials()
             } label: {
@@ -2603,17 +2704,6 @@ private struct UntypeRootView: View {
         Binding(
             get: { model.settings.appearance },
             set: { model.updateLayout(appearance: $0) }
-        )
-    }
-
-    /// Top-bar hotkey mode switch: on = push-to-talk (hold to record, release
-    /// to submit), off = push-to-listen (press to start, press again to stop
-    /// and submit). Changing the mode does not reconfigure the hotkey monitor
-    /// or restart the warm session, so it is safe at any time.
-    private var pushToTalkBinding: Binding<Bool> {
-        Binding(
-            get: { model.settings.hotkeyHoldToTalk },
-            set: { model.update(UntypeUISettingsPatch(hotkeyHoldToTalk: $0)) }
         )
     }
 
@@ -3481,7 +3571,9 @@ private final class UntypeOverlayController: ObservableObject {
     @Published fileprivate private(set) var namingCancelling = false
     /// Return confirms and Esc cancels while naming (the keys are caught).
     @Published fileprivate private(set) var namingKeysActive = false
-    private lazy var namingKeys = UntypeNamingKeyTap { [weak self] confirm in
+    /// A hands-free dictation turn: how to finish it, over the trace.
+    @Published fileprivate private(set) var handsFreeHint: String?
+    private lazy var namingKeys = UntypeReturnEscapeKeyTap { [weak self] confirm in
         dispatchToUI { [weak self] in
             if confirm {
                 self?.finishNaming()
@@ -3512,6 +3604,8 @@ private final class UntypeOverlayController: ObservableObject {
     fileprivate static let reminderRecordKey = "reminder.record"
     fileprivate static let reminderDismissKey = "reminder.dismiss"
     fileprivate static let translationKeyPrefix = "translate:"
+    /// The pin shown on a hovered chip: `pin:R`.
+    fileprivate static let pinKeyPrefix = "pin:"
 
     init(model: UntypeUIModel) {
         self.model = model
@@ -3596,6 +3690,14 @@ private final class UntypeOverlayController: ObservableObject {
 
     func refreshOperators() {
         operatorVersion += 1
+    }
+
+    /// Shown over the recording trace while a tapped turn records
+    /// hands-free; nil removes it.
+    func setHandsFreeHint(_ hint: String?) {
+        if handsFreeHint != hint {
+            handsFreeHint = hint
+        }
     }
 
     /// A meeting recording started (its start) or ended (nil).
@@ -3843,10 +3945,12 @@ private final class UntypeOverlayController: ObservableObject {
         // mouse is on the tray (drawn there while the pointer is inside).
         // With the tray closed only the chips and the (invisible) Record spot
         // react; the tray's other controls wait until it is open.
-        let control = chipFrames.first { key, frame in
-            let hidden = !trayOpen && (key.hasPrefix(Self.translationKeyPrefix) || key == Self.settingsKey)
+        let touched = chipFrames.filter { key, frame in
+            let hidden = !trayOpen && (key.hasPrefix(Self.translationKeyPrefix) || key == Self.settingsKey || key.hasPrefix(Self.pinKeyPrefix))
             return !hidden && frame.insetBy(dx: -3, dy: -3).contains(location)
-        }?.key
+        }.map(\.key)
+        // A pin sits on its chip's corner and wins over it.
+        let control = touched.first { $0.hasPrefix(Self.pinKeyPrefix) } ?? touched.sorted().first
         if phase == "idle", !trayOpen, let control,
            control.count == 1 || (control == Self.meetingKey && meetingStart == nil) {
             trayOpen = true
@@ -4069,6 +4173,15 @@ private final class UntypeOverlayController: ObservableObject {
         )
     }
 
+    /// The chips the idle overlay shows at rest (empty: all).
+    fileprivate var pinnedOperators: [String] {
+        model?.settings.pinnedOperators ?? []
+    }
+
+    fileprivate func togglePin(letter: String) {
+        model?.togglePinnedOperator(letter)
+    }
+
     /// A click on an operator chip: the same as its key while holding
     /// push-to-talk.
     fileprivate func toggleOperator(letter: String) {
@@ -4230,6 +4343,13 @@ private struct UntypeOverlayView: View {
            let choice = Self.translationChoices.first(where: { UntypeOverlayController.translationKeyPrefix + $0.policy.rawValue == key }) {
             return (choice.title, choice.detail)
         }
+        if let key = controller.hoveredChip, key.hasPrefix(UntypeOverlayController.pinKeyPrefix) {
+            let letter = String(key.dropFirst(UntypeOverlayController.pinKeyPrefix.count))
+            let name = controller.operatorSnapshot.first { $0.label == letter }?.name ?? letter
+            return controller.pinnedOperators.contains(letter)
+                ? ("Unpin \(name)", "Shown only when the mouse is on the overlay")
+                : ("Pin \(name)", "Always shown, also at rest")
+        }
         guard let item = hoveredChip else {
             return nil
         }
@@ -4257,11 +4377,50 @@ private struct UntypeOverlayView: View {
         chipsRest ? Self.restingChipOpacity : 1
     }
 
+    /// At rest (idle or under a card, the mouse away from the overlay) only
+    /// the pinned chips show, and any chip that is on; while dictating, or
+    /// as soon as the mouse enters the overlay, all of them.
+    private var chipsCollapsed: Bool {
+        (isIdle || showsCard) && !controller.trayOpen && !controller.pointerInside
+    }
+
+    private var shownOperators: [(label: String, name: String, enabled: Bool)] {
+        let all = controller.operatorSnapshot
+        let pinned = controller.pinnedOperators
+        guard chipsCollapsed, !pinned.isEmpty else {
+            return all
+        }
+        return all.filter { pinned.contains($0.label) || $0.enabled }
+    }
+
+    /// The pin on the hovered chip's corner (only in the open tray).
+    private func pinBadge(_ letter: String) -> some View {
+        let key = UntypeOverlayController.pinKeyPrefix + letter
+        let pinned = controller.pinnedOperators.contains(letter)
+        let hovered = controller.hoveredChip == key
+        return Button {
+            controller.togglePin(letter: letter)
+        } label: {
+            Image(systemName: pinned ? "pin.fill" : "pin")
+                .font(.system(size: 6.5, weight: .bold))
+                .foregroundStyle(pinned ? Color.black.opacity(0.85) : Color.white)
+                .frame(width: 13, height: 13)
+                .background(Circle().fill(pinned ? Color.white : Color(white: 0.08)))
+                .overlay(Circle().strokeBorder(Color.white.opacity(hovered ? 0.95 : 0.5), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .contentShape(Circle())
+        .background(hitFrame(key))
+        .offset(x: 8, y: -9)
+        .accessibilityLabel(pinned ? "Unpin" : "Pin")
+    }
+
     /// The tray's two lines: the control under the mouse (what it is, what
     /// it does), otherwise what a dictation does now.
     private var trayStatus: (title: String, detail: String?)? {
         if let item = hoveredChip {
-            return (item.name, Self.operatorHints[item.label])
+            let pinned = controller.pinnedOperators.contains(item.label) ? " · pinned" : ""
+            return (item.name + pinned, Self.operatorHints[item.label])
         }
         if let tooltip {
             return tooltip
@@ -4733,10 +4892,22 @@ private struct UntypeOverlayView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .accessibilityHidden(true)
+                .overlay(alignment: .top) {
+                    if isRecording, let hint = controller.handsFreeHint {
+                        Text(hint)
+                            .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                            .foregroundStyle(Color.white)
+                            .lineLimit(1)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 2)
+                            .background(Capsule(style: .continuous).fill(Color.black.opacity(0.7)))
+                            .accessibilityLabel(hint)
+                    }
+                }
             }
 
             HStack(spacing: 6) {
-                ForEach(controller.operatorSnapshot, id: \.label) { item in
+                ForEach(shownOperators, id: \.label) { item in
                     Button {
                         controller.toggleOperator(letter: item.label)
                     } label: {
@@ -4745,9 +4916,16 @@ private struct UntypeOverlayView: View {
                     .buttonStyle(.plain)
                     .contentShape(Capsule(style: .continuous))
                     .background(hitFrame(item.label))
+                    .overlay(alignment: .topTrailing) {
+                        if showsTray, controller.hoveredChip == item.label
+                            || controller.hoveredChip == UntypeOverlayController.pinKeyPrefix + item.label {
+                            pinBadge(item.label)
+                        }
+                    }
                 }
             }
             .opacity(chipOpacity)
+            .animation(.easeOut(duration: 0.15), value: chipsCollapsed)
         }
         .padding(.top, 2)
         .padding(.bottom, 5)
@@ -5120,9 +5298,7 @@ struct UntypeOnboardingView: View {
                         }
                         .buttonStyle(.borderless)
                     }
-                    Text(model.settings.hotkeyHoldToTalk
-                         ? "Hold to record, release to submit. Auto-warms a new provider session after each turn."
-                         : "Press to start recording, press again to stop and submit. Auto-warms a new provider session after each turn.")
+                    Text("Hold to record, release to submit; or tap, then Enter sends, the hotkey types only, Esc discards. Auto-warms a new provider session after each turn.")
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -5591,6 +5767,7 @@ private final class UntypeHotkeyMonitor {
                 }
                 return self.handle(event: event, source: "local-monitor", suppress: true) ? nil : event
             }
+            model?.appendEvent("diagnostic.info: [untype] hotkey monitor: \(model?.hotkeyMonitorStatus ?? "unknown") (\(settings.hotkey))")
         } catch {
             model?.hotkeyMonitorStatus = "invalid hotkey"
             model?.events.append("diagnostic.warning: \(error.localizedDescription)")
@@ -5622,6 +5799,11 @@ private final class UntypeHotkeyMonitor {
         // or operator toggle.
         if let cgEvent = event.cgEvent, isUntypeSyntheticKeyboardEvent(cgEvent) {
             return false
+        }
+        if event.type == .keyDown, !event.isARepeat, descriptor.matches(event) {
+            dispatch(.trace("\(source) down"))
+        } else if event.type == .keyUp || event.type == .flagsChanged, descriptor.releases(event) {
+            dispatch(.trace("\(source) \(event.type == .keyUp ? "up" : "flags")"))
         }
         if event.type == .keyDown {
             if event.isARepeat, descriptor.matches(event) {
@@ -5679,6 +5861,8 @@ private final class UntypeHotkeyMonitor {
             case .warning(let message):
                 model.hotkeyMonitorStatus = "event tap warning"
                 model.events.append("diagnostic.warning: \(message)")
+            case .trace(let message):
+                model.appendEvent("diagnostic.info: [untype] hotkey raw: \(message)")
             }
         }
     }
@@ -5763,11 +5947,13 @@ private final class UntypeCarbonHotkeyMonitor {
         }
         switch GetEventKind(event) {
         case UInt32(kEventHotKeyPressed):
+            emit(.trace("carbon-hotkey down"))
             if state.markPressed() {
                 emit(.press(source: "carbon-hotkey"))
             }
             return noErr
         case UInt32(kEventHotKeyReleased):
+            emit(.trace("carbon-hotkey up"))
             if state.markReleased() {
                 emit(.release(source: "carbon-hotkey"))
             }
@@ -5792,6 +5978,9 @@ private enum UntypeHotkeyEvent: Sendable {
     case toggleOperator(OperatorKey, source: String)
     case selectionHotkey(source: String)
     case warning(String)
+    /// Every raw down/up of the hotkey a listener sees, before deduplication,
+    /// so a release that never arrives can be traced to the listener.
+    case trace(String)
 }
 
 private final class UntypeHotkeySharedState: @unchecked Sendable {
@@ -5920,6 +6109,11 @@ private final class UntypeQuartzHotkeyEventTap {
         if isUntypeSyntheticKeyboardEvent(event) {
             return false
         }
+        if type == .keyDown, descriptor.matches(event), event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+            emit(.trace("quartz-event-tap down"))
+        } else if type == .keyUp || type == .flagsChanged, descriptor.releases(event) {
+            emit(.trace("quartz-event-tap \(type == .keyUp ? "up" : "flags")"))
+        }
         if type == .keyDown {
             if descriptor.matches(event), event.getIntegerValueField(.keyboardEventAutorepeat) != 0 {
                 return true
@@ -5956,11 +6150,12 @@ private final class UntypeQuartzHotkeyEventTap {
     }
 }
 
-/// Return and Esc while the overlay listens to a meeting's name: caught
-/// before the app in front sees them (the overlay never takes the keyboard
-/// focus), and only for that moment. Independent of the push-to-talk hotkey
-/// monitors; every other key passes through untouched.
-private final class UntypeNamingKeyTap {
+/// Return and Esc caught before the app in front sees them (the overlay
+/// never takes the keyboard focus), only while they have a meaning for
+/// untype: naming a meeting, or finishing a hands-free dictation turn.
+/// Independent of the push-to-talk hotkey monitors; every other key, and
+/// any key with a modifier, passes through untouched.
+private final class UntypeReturnEscapeKeyTap {
     /// `true`: Return or Enter (confirm); `false`: Esc (cancel).
     private let onKey: @Sendable (Bool) -> Void
     private var eventTap: CFMachPort?
@@ -6048,7 +6243,7 @@ private let untypeNamingKeyTapCallback: CGEventTapCallBack = { _, type, event, u
     guard let userInfo else {
         return Unmanaged.passUnretained(event)
     }
-    let tap = Unmanaged<UntypeNamingKeyTap>.fromOpaque(userInfo).takeUnretainedValue()
+    let tap = Unmanaged<UntypeReturnEscapeKeyTap>.fromOpaque(userInfo).takeUnretainedValue()
     if tap.handle(type: type, event: event) {
         return nil
     }
